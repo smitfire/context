@@ -233,7 +233,9 @@ export class ForewispDaemonClient {
     const data = (await resp.json()) as { entry?: { id?: unknown; version?: unknown }; deduplicated?: unknown };
     const id = typeof data.entry?.id === 'string' ? data.entry.id : '';
     const version = typeof data.entry?.version === 'number' ? data.entry.version : 1;
-    if (!id) throw new Error('Invalid Forewisp /v1/contributions response');
+    if (!id || !/^[A-Za-z0-9._:-]{1,200}$/.test(id)) {
+      throw new Error('Invalid entry id in Forewisp /v1/contributions response');
+    }
     return { id, version, deduplicated: Boolean(data.deduplicated) };
   }
 

@@ -29,6 +29,7 @@ export declare class ForewispBridge implements NsContextService {
     }): Promise<RetrievalResult>;
     markPresented(conversationId: string, entryIds: readonly string[], opts?: {
         offerId?: string;
+        daemonSessionId?: string;
     }): void;
     private pageUtf8;
     expand(id: string, opts?: {

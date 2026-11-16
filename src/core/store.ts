@@ -465,16 +465,21 @@ export class ForewispBridge implements NsContextService {
     };
   }
 
-  markPresented(conversationId: string, entryIds: readonly string[], opts?: { offerId?: string }): void {
+  markPresented(
+    conversationId: string,
+    entryIds: readonly string[],
+    opts?: { offerId?: string; daemonSessionId?: string },
+  ): void {
     const nowSec = Math.floor(Date.now() / 1000);
     const stmt = this.db.prepare(
       'INSERT OR IGNORE INTO session_seen (conversation_id, entry_key, presented_at) VALUES (?, ?, ?)',
     );
+    const feedbackSession = opts?.daemonSessionId ?? conversationId;
     for (const key of entryIds) {
       stmt.run(conversationId, key, nowSec);
       if (opts?.offerId) {
         const bareId = key.includes(':') ? key.slice(0, key.lastIndexOf(':')) : key;
-        const meta = { conversationId, offerId: opts.offerId };
+        const meta = { conversationId: feedbackSession, offerId: opts.offerId };
         this.daemonOfferMeta.set(bareId, meta);
         this.daemonOfferMeta.set(key, meta);
         while (this.daemonOfferMeta.size > 500) {
@@ -707,8 +712,10 @@ export class ForewispBridge implements NsContextService {
     } catch (err) {
       if (this.mode === 'daemon' && localOutcome.id) {
         // Compensate local commit so strict daemon mode leaves zero unacknowledged local entries.
-        this.db.exec('BEGIN IMMEDIATE');
+        let inCompTx = false;
         try {
+          this.db.exec('BEGIN IMMEDIATE');
+          inCompTx = true;
           if (priorRecord === null) {
             this.db.prepare('DELETE FROM entries_fts WHERE id = ?').run(localOutcome.id);
             this.db.prepare('DELETE FROM entries WHERE id = ?').run(localOutcome.id);
@@ -741,8 +748,11 @@ export class ForewispBridge implements NsContextService {
               .run(priorRecord.id, priorRecord.title, priorRecord.summary, priorRecord.body, priorRecord.keywords);
           }
           this.db.exec('COMMIT');
+          inCompTx = false;
         } catch (rollbackErr) {
-          try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+          if (inCompTx) {
+            try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+          }
           throw rollbackErr;
         }
         return {

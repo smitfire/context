@@ -190,10 +190,12 @@ export function apply(ctx, rawConfig = {}) {
                 const header = `[${o.id}@v${o.version} | ${o.kind}/${o.scope} | ${o.title}]`;
                 return `${header}\n${o.inlineBody ?? o.summary}`;
             });
+            const safeStrategy = st.lastStrategy && /^[\w-]{1,64}$/.test(st.lastStrategy) ? st.lastStrategy : undefined;
+            const safeTier = /^[\w-]{1,64}$/.test(st.lastTier) ? st.lastTier : 'speed1_local';
             const attrs = [
                 `count="${st.activeOffers.length}"`,
-                `tier="${st.lastTier}"`,
-                ...(st.lastStrategy ? [`strategy="${st.lastStrategy}"`] : []),
+                `tier="${safeTier}"`,
+                ...(safeStrategy ? [`strategy="${safeStrategy}"`] : []),
             ].join(' ');
             return `<forewisp-context ${attrs}>\n${lines.join('\n\n')}\n</forewisp-context>`;
         },
@@ -222,17 +224,9 @@ export function apply(ctx, rawConfig = {}) {
                             st.lastStrategy = ev.strategy;
                             st.lastTier = ev.strategy === 'jev' ? 'forewisp_jev' : 'forewisp_lexical';
                             st.daemonUnavailable = false;
-                            if (ev.entries.length > 0) {
-                                const byId = new Map();
-                                for (const entry of ev.entries)
-                                    byId.set(entry.id, entry);
-                                for (const old of st.activeOffers) {
-                                    if (!byId.has(old.id))
-                                        byId.set(old.id, old);
-                                }
-                                st.activeOffers = Array.from(byId.values()).slice(0, config.maxOffers);
-                                pruneAckedForOffers(st);
-                            }
+                            // Replace active offer set per authoritative SSE event so stale retrieval offers retire cleanly.
+                            st.activeOffers = ev.entries.slice(0, config.maxOffers);
+                            pruneAckedForOffers(st);
                         }
                         if (disposed || signal.aborted || states.get(st.conversationId) !== st)
                             break;
@@ -251,11 +245,15 @@ export function apply(ctx, rawConfig = {}) {
                     }
                     await new Promise((resolveDelay) => {
                         const delayMs = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** (reconnects - 1));
-                        const t = setTimeout(resolveDelay, delayMs);
-                        signal.addEventListener('abort', () => {
+                        const onAbort = () => {
                             clearTimeout(t);
                             resolveDelay();
-                        }, { once: true });
+                        };
+                        const t = setTimeout(() => {
+                            signal.removeEventListener('abort', onAbort);
+                            resolveDelay();
+                        }, delayMs);
+                        signal.addEventListener('abort', onAbort, { once: true });
                     });
                 }
             }
@@ -340,7 +338,7 @@ export function apply(ctx, rawConfig = {}) {
                             byOffer.set(groupKey, [item.key]);
                     }
                     for (const [offerKey, keys] of byOffer) {
-                        bridge.markPresented(st.conversationId, keys, offerKey ? { offerId: offerKey } : undefined);
+                        bridge.markPresented(st.conversationId, keys, offerKey ? { offerId: offerKey, daemonSessionId: st.forewispSessionId } : undefined);
                     }
                     st.renderedMeta = [];
                     st.totalOffersPresented += snapshot.length;

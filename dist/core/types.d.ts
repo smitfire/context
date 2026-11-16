@@ -142,6 +142,7 @@ export interface NsContextService {
     }>;
     markPresented(conversationId: string, entryIds: readonly string[], opts?: {
         offerId?: string;
+        daemonSessionId?: string;
     }): void;
     stats(): Promise<{
         entries: number;

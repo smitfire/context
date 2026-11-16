@@ -149,7 +149,11 @@ export interface NsContextService {
     helpful: boolean,
     opts?: { conversationId?: string; offerId?: string },
   ): Promise<{ ok: boolean; helpful: number; harmful: number; daemonRecorded?: boolean; localFound?: boolean }>;
-  markPresented(conversationId: string, entryIds: readonly string[], opts?: { offerId?: string }): void;
+  markPresented(
+    conversationId: string,
+    entryIds: readonly string[],
+    opts?: { offerId?: string; daemonSessionId?: string },
+  ): void;
   stats(): Promise<{
     entries: number;
     active: number;
