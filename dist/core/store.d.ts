@@ -1,4 +1,5 @@
-import type { ContextBridgeOptions, ContextMode, KnowledgeWriteRequest, NsContextService, RetrievalResult, UpsertOutcome } from './types.js';
+import type { ContextBridgeOptions, ContextMode, DaemonHealthStatus, KnowledgeWriteRequest, NsContextService, RetrievalResult, UpsertOutcome } from './types.js';
+import { ForewispDaemonClient } from './daemon-client.js';
 export declare class ForewispBridge implements NsContextService {
     readonly mode: ContextMode;
     private readonly workspaceRoot;
@@ -8,9 +9,16 @@ export declare class ForewispBridge implements NsContextService {
     private readonly inlineBytes;
     private readonly maxOffers;
     private readonly turn1TimeoutMs;
+    private readonly daemon?;
+    private readonly daemonOfferMeta;
+    private cachedHealth?;
     private readonly db;
     private cachedDeps?;
     constructor(options: ContextBridgeOptions);
+    getDaemonClient(): ForewispDaemonClient | undefined;
+    daemonHealth(opts?: {
+        refresh?: boolean;
+    }): Promise<DaemonHealthStatus>;
     private openDatabase;
     private safeJsonParse;
     private getDeps;
@@ -19,7 +27,11 @@ export declare class ForewispBridge implements NsContextService {
     retrieve(query: string, conversationId?: string, opts?: {
         timeoutMs?: number;
     }): Promise<RetrievalResult>;
-    markPresented(conversationId: string, entryIds: readonly string[]): void;
+    markPresented(conversationId: string, entryIds: readonly string[], opts?: {
+        offerId?: string;
+        daemonSessionId?: string;
+    }): void;
+    private pageUtf8;
     expand(id: string, opts?: {
         allowStale?: boolean;
         offset?: number;
@@ -28,22 +40,30 @@ export declare class ForewispBridge implements NsContextService {
         found: boolean;
         stale: boolean;
         driftedFiles: string[];
+        daemonUnavailable?: boolean;
         content?: string;
         totalBytes?: number;
         version?: number;
         recordSha256?: string;
     }>;
     upsert(req: KnowledgeWriteRequest): Promise<UpsertOutcome>;
-    feedback(id: string, helpful: boolean): Promise<{
+    private syncUpsertToDaemon;
+    feedback(id: string, helpful: boolean, opts?: {
+        conversationId?: string;
+        offerId?: string;
+    }): Promise<{
         ok: boolean;
         helpful: number;
         harmful: number;
+        daemonRecorded?: boolean;
+        localFound?: boolean;
     }>;
     stats(): Promise<{
         entries: number;
         active: number;
         drifted: number;
         presentedCount: number;
+        daemon: DaemonHealthStatus;
     }>;
     close(): void;
 }
