@@ -562,40 +562,8 @@ export class ForewispBridge implements NsContextService {
       `wisp_${createHash('sha256').update(`${req.kind}:${scope}:${req.title.trim()}`).digest('hex').slice(0, 12)}`;
     const nowSec = Math.floor(Date.now() / 1000);
 
-    // In strict daemon mode, require the daemon contribution to succeed before committing locally.
-    let preSyncedDaemonId: string | undefined;
-    if (this.mode === 'daemon') {
-      if (!this.daemon) {
-        return { ok: false, status: 'rejected', reason: 'Forewisp daemon client is not configured' };
-      }
-      const existingCheck = this.db
-        .prepare('SELECT * FROM entries WHERE id = ?')
-        .get(deterministicId) as Record<string, unknown> | undefined;
-      if (existingCheck) {
-        const current = this.rowToRecord(existingCheck);
-        if (
-          (req.baseRevision !== undefined && req.baseRevision !== current.version) ||
-          (req.baseRecordSha256 !== undefined && req.baseRecordSha256 !== current.recordSha256)
-        ) {
-          return {
-            ok: false,
-            status: 'conflict',
-            id: current.id,
-            version: current.version,
-            recordSha256: current.recordSha256,
-            reason: `knowledge_revision_conflict: expected v${req.baseRevision ?? '?'} (${req.baseRecordSha256 ?? '?'})`,
-          };
-        }
-      }
-      try {
-        preSyncedDaemonId = (await this.daemon.contribute(req)).id;
-      } catch (err) {
-        return {
-          ok: false,
-          status: 'rejected',
-          reason: err instanceof Error ? err.message : String(err),
-        };
-      }
+    if (this.mode === 'daemon' && !this.daemon) {
+      return { ok: false, status: 'rejected', reason: 'Forewisp daemon client is not configured' };
     }
 
     this.db.exec('BEGIN IMMEDIATE');
@@ -656,9 +624,8 @@ export class ForewispBridge implements NsContextService {
           id: deterministicId,
           version: nextVer,
           recordSha256,
-          ...(preSyncedDaemonId ? { daemonId: preSyncedDaemonId, daemonSynced: true } : {}),
         };
-        return preSyncedDaemonId ? localOutcome : await this.syncUpsertToDaemon(req, localOutcome);
+        return await this.syncUpsertToDaemon(req, localOutcome, current);
       }
 
       this.db
@@ -690,9 +657,8 @@ export class ForewispBridge implements NsContextService {
         id: deterministicId,
         version: 1,
         recordSha256,
-        ...(preSyncedDaemonId ? { daemonId: preSyncedDaemonId, daemonSynced: true } : {}),
       };
-      return preSyncedDaemonId ? localInsert : await this.syncUpsertToDaemon(req, localInsert);
+      return await this.syncUpsertToDaemon(req, localInsert, null);
     } catch (err) {
       if (inTx) {
         try { this.db.exec('ROLLBACK'); } catch { /* preserve original error if already rolled back */ }
@@ -701,12 +667,62 @@ export class ForewispBridge implements NsContextService {
     }
   }
 
-  private async syncUpsertToDaemon(req: KnowledgeWriteRequest, localOutcome: UpsertOutcome): Promise<UpsertOutcome> {
+  private async syncUpsertToDaemon(
+    req: KnowledgeWriteRequest,
+    localOutcome: UpsertOutcome,
+    priorRecord: ContextEntryRecord | null,
+  ): Promise<UpsertOutcome> {
     if (this.mode === 'local' || !this.daemon) return localOutcome;
     try {
       const remote = await this.daemon.contribute(req);
       return { ...localOutcome, daemonId: remote.id, daemonSynced: true };
-    } catch {
+    } catch (err) {
+      if (this.mode === 'daemon' && localOutcome.id) {
+        // Compensate local commit so strict daemon mode leaves zero unacknowledged local entries.
+        this.db.exec('BEGIN IMMEDIATE');
+        try {
+          if (priorRecord === null) {
+            this.db.prepare('DELETE FROM entries_fts WHERE id = ?').run(localOutcome.id);
+            this.db.prepare('DELETE FROM entries WHERE id = ?').run(localOutcome.id);
+          } else {
+            this.db
+              .prepare(
+                `UPDATE entries
+                 SET version = ?, record_sha256 = ?, kind = ?, scope = ?, title = ?, summary = ?, body = ?, keywords = ?,
+                     source_hashes = ?, wikitrace_json = ?, withdrawn = ?, updated_at = ?
+                 WHERE id = ?`,
+              )
+              .run(
+                priorRecord.version,
+                priorRecord.recordSha256,
+                priorRecord.kind,
+                priorRecord.scope,
+                priorRecord.title,
+                priorRecord.summary,
+                priorRecord.body,
+                priorRecord.keywords,
+                JSON.stringify(priorRecord.sourceHashes),
+                JSON.stringify(priorRecord.wikitrace),
+                priorRecord.withdrawn ? 1 : 0,
+                priorRecord.updatedAt,
+                localOutcome.id,
+              );
+            this.db.prepare('DELETE FROM entries_fts WHERE id = ?').run(localOutcome.id);
+            this.db
+              .prepare('INSERT INTO entries_fts (id, title, summary, body, keywords) VALUES (?, ?, ?, ?, ?)')
+              .run(priorRecord.id, priorRecord.title, priorRecord.summary, priorRecord.body, priorRecord.keywords);
+          }
+          this.db.exec('COMMIT');
+        } catch (rollbackErr) {
+          try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+          throw rollbackErr;
+        }
+        return {
+          ok: false,
+          status: 'rejected',
+          reason: err instanceof Error ? err.message : String(err),
+        };
+      }
       return { ...localOutcome, daemonSynced: false };
     }
   }

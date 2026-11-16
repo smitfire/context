@@ -24,7 +24,12 @@ function mapKindToForewisp(kind) {
         return 'plugin';
     return 'memory';
 }
+function safeTimeoutSignal(ms, floor, fallback) {
+    const raw = typeof ms === 'number' && Number.isFinite(ms) ? ms : fallback;
+    return AbortSignal.timeout(Math.min(60_000, Math.max(floor, Math.trunc(raw))));
+}
 function mapScopeToForewisp(scope) {
+    // Repository-local and personal entries map to 'private' on a remote daemon unless explicitly shared at org/public scope.
     if (scope === undefined || scope === 'agent' || scope === 'user' || scope === 'repository')
         return 'private';
     if (scope === 'organization')
@@ -93,7 +98,7 @@ export class ForewispDaemonClient {
             const resp = await this.fetcher(this.url('/health'), {
                 method: 'GET',
                 redirect: 'error',
-                signal: AbortSignal.timeout(Math.max(100, timeoutMs)),
+                signal: safeTimeoutSignal(timeoutMs, 100, 1000),
             });
             if (!resp.ok) {
                 return { configured: true, reachable: false, error: `HTTP ${resp.status}` };
@@ -123,7 +128,7 @@ export class ForewispDaemonClient {
                 content: query.slice(0, 15_000),
                 kinds: opts.kinds ?? ['memory', 'skill', 'plugin'],
             }),
-            signal: AbortSignal.timeout(Math.max(150, opts.timeoutMs ?? 3000)),
+            signal: safeTimeoutSignal(opts.timeoutMs, 150, 3000),
         });
         if (!resp.ok)
             throw new Error(`Forewisp /v1/recall HTTP ${resp.status}`);
@@ -140,9 +145,22 @@ export class ForewispDaemonClient {
             const offer = parseOfferEntry(raw);
             if (!offer)
                 continue;
-            const cost = Buffer.byteLength(offer.inlineBody ?? offer.summary, 'utf8');
-            if (usedBytes + cost > inlineBytes && offers.length > 0)
-                continue;
+            let cost = Buffer.byteLength(offer.inlineBody ?? offer.summary, 'utf8');
+            if (usedBytes + cost > inlineBytes) {
+                if (offers.length > 0)
+                    continue;
+                // Clamp oversized first offer down to summary within byte budget rather than blowing inlineBytes.
+                const maxFirst = Math.max(64, inlineBytes);
+                if (Buffer.byteLength(offer.summary, 'utf8') <= maxFirst && offer.inlineBody) {
+                    offer.inlineBody = offer.summary;
+                }
+                else {
+                    offer.inlineBody = undefined;
+                }
+                cost = Buffer.byteLength(offer.inlineBody ?? offer.summary, 'utf8');
+                if (cost > maxFirst)
+                    continue;
+            }
             offers.push(offer);
             usedBytes += cost;
         }
@@ -158,7 +176,7 @@ export class ForewispDaemonClient {
             method: 'GET',
             redirect: 'error',
             headers: this.headers(false),
-            signal: AbortSignal.timeout(Math.max(150, timeoutMs)),
+            signal: safeTimeoutSignal(timeoutMs, 150, 3000),
         });
         if (resp.status === 404)
             return { found: false };
@@ -191,7 +209,7 @@ export class ForewispDaemonClient {
             redirect: 'error',
             headers: this.headers(true),
             body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(Math.max(250, opts.timeoutMs ?? 5000)),
+            signal: safeTimeoutSignal(opts.timeoutMs, 250, 5000),
         });
         if (!resp.ok)
             throw new Error(`Forewisp /v1/contributions HTTP ${resp.status}`);
@@ -203,7 +221,7 @@ export class ForewispDaemonClient {
         return { id, version, deduplicated: Boolean(data.deduplicated) };
     }
     async observeEvent(sessionId, sequence, content, opts = {}) {
-        const timeoutSig = AbortSignal.timeout(Math.max(150, opts.timeoutMs ?? 3000));
+        const timeoutSig = safeTimeoutSignal(opts.timeoutMs, 150, 3000);
         const signal = opts.signal ? AbortSignal.any([timeoutSig, opts.signal]) : timeoutSig;
         const resp = await this.fetcher(this.url('/v1/events'), {
             method: 'POST',
@@ -220,9 +238,10 @@ export class ForewispDaemonClient {
         if (!resp.ok)
             throw new Error(`Forewisp /v1/events HTTP ${resp.status}`);
         const data = (await resp.json());
+        const ackSeq = Number.isSafeInteger(data.sequence) && Number(data.sequence) >= 0 ? Number(data.sequence) : sequence;
         return {
             accepted: Boolean(data.accepted),
-            sequence: typeof data.sequence === 'number' ? data.sequence : sequence,
+            sequence: ackSeq,
             reason: typeof data.reason === 'string' ? data.reason : undefined,
         };
     }
@@ -245,7 +264,7 @@ export class ForewispDaemonClient {
                 entry_id: entryId,
                 verdict,
             }),
-            signal: AbortSignal.timeout(Math.max(150, timeoutMs)),
+            signal: safeTimeoutSignal(timeoutMs, 150, 3000),
         });
         if (!resp.ok)
             return false;
