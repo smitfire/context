@@ -44,19 +44,24 @@ export interface ContextOffer {
     id: string;
     version: number;
     recordSha256: string;
-    kind: ContextKind;
-    scope: ContextScope;
+    kind: ContextKind | 'plugin';
+    scope: ContextScope | 'community';
     title: string;
     summary: string;
     inlineBody?: string;
     driftedFiles: string[];
     score: number;
     expandBytes: number;
+    offerId?: string;
+    sessionId?: string;
 }
 export interface RetrievalResult {
     offers: ContextOffer[];
     latencyMs: number;
-    tier: 'speed1_local' | 'daemon_v2';
+    tier: 'speed1_local' | 'forewisp_lexical' | 'forewisp_jev' | 'daemon_v2';
+    strategy?: string;
+    daemonUnavailable?: boolean;
+    offerId?: string;
     totalBytes: number;
 }
 export interface ValidationIssue {
@@ -67,6 +72,8 @@ export interface UpsertOutcome {
     ok: boolean;
     status: 'inserted' | 'updated' | 'conflict' | 'rejected';
     id?: string;
+    daemonId?: string;
+    daemonSynced?: boolean;
     version?: number;
     recordSha256?: string;
     reason?: string;
@@ -86,6 +93,14 @@ export interface ContextBridgeOptions {
     inlineBytes?: number;
     maxOffers?: number;
     turn1TimeoutMs?: number;
+    fetch?: typeof fetch;
+}
+export interface DaemonHealthStatus {
+    configured: boolean;
+    reachable: boolean;
+    strategy?: string;
+    pilot?: boolean;
+    error?: string;
 }
 export interface NsContextService {
     readonly mode: ContextMode;
@@ -106,17 +121,25 @@ export interface NsContextService {
         recordSha256?: string;
     }>;
     upsert(req: KnowledgeWriteRequest): Promise<UpsertOutcome>;
-    feedback(id: string, helpful: boolean): Promise<{
+    feedback(id: string, helpful: boolean, opts?: {
+        conversationId?: string;
+        offerId?: string;
+    }): Promise<{
         ok: boolean;
         helpful: number;
         harmful: number;
+        daemonRecorded?: boolean;
     }>;
-    markPresented(conversationId: string, entryIds: readonly string[]): void;
+    markPresented(conversationId: string, entryIds: readonly string[], opts?: {
+        offerId?: string;
+    }): void;
     stats(): Promise<{
         entries: number;
         active: number;
         drifted: number;
         presentedCount: number;
+        daemon: DaemonHealthStatus;
     }>;
+    daemonHealth(): Promise<DaemonHealthStatus>;
 }
 //# sourceMappingURL=types.d.ts.map

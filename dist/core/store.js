@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { ForewispDaemonClient } from './daemon-client.js';
 import { computeRecordSha256, containsSecrets, detectDriftedFiles, inspectWorkspaceDependencies, isWikiTraceCompatible, looksLikePromptInjection, validateKnowledgeWrite, } from './validator.js';
 const LOCAL_SCHEMA_VERSION = 5;
 function tokenize(text) {
@@ -31,6 +32,8 @@ export class ForewispBridge {
     inlineBytes;
     maxOffers;
     turn1TimeoutMs;
+    daemon;
+    daemonOfferMeta = new Map();
     db;
     cachedDeps;
     constructor(options) {
@@ -42,7 +45,28 @@ export class ForewispBridge {
         this.inlineBytes = options.inlineBytes ?? 1800;
         this.maxOffers = options.maxOffers ?? 3;
         this.turn1TimeoutMs = options.turn1TimeoutMs ?? 50;
+        if (this.mode !== 'local' && this.daemonUrl) {
+            try {
+                this.daemon = new ForewispDaemonClient({
+                    endpoint: this.daemonUrl,
+                    token: this.daemonToken,
+                    fetch: options.fetch,
+                });
+            }
+            catch {
+                this.daemon = undefined;
+            }
+        }
         this.db = this.openDatabase();
+    }
+    getDaemonClient() {
+        return this.daemon;
+    }
+    async daemonHealth() {
+        if (!this.daemon) {
+            return { configured: Boolean(this.daemonUrl), reachable: false };
+        }
+        return this.daemon.health();
     }
     openDatabase() {
         const dir = dirname(this.dbPath);
@@ -159,55 +183,76 @@ export class ForewispBridge {
             updatedAt: Number(row.updated_at ?? 0),
         };
     }
-    async tryDaemonRetrieve(query, timeoutMs) {
-        if (this.mode === 'local' || !this.daemonUrl)
-            return null;
+    async tryDaemonRetrieve(query, conversationId, timeoutMs) {
+        if (this.mode === 'local' || !this.daemon)
+            return { unavailable: true };
         try {
-            const parsed = new URL(this.daemonUrl);
-            const isLoopback = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
-            if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLoopback))
-                return null;
-            const resp = await fetch(`${this.daemonUrl.replace(/\/$/, '')}/v1/events`, {
-                method: 'POST',
-                redirect: 'manual',
-                headers: {
-                    'content-type': 'application/json',
-                    ...(this.daemonToken ? { authorization: `Bearer ${this.daemonToken}` } : {}),
-                },
-                body: JSON.stringify({ query }),
-                signal: AbortSignal.timeout(Math.max(50, timeoutMs)),
+            const started = performance.now();
+            const { strategy, offers: rawOffers } = await this.daemon.recall(query, {
+                timeoutMs: Math.max(250, timeoutMs),
+                maxOffers: this.maxOffers,
+                inlineBytes: this.inlineBytes,
             });
-            if (!resp.ok)
-                return null;
-            const data = (await resp.json());
-            if (!Array.isArray(data.offers))
-                return null;
-            const validOffers = data.offers.filter((o) => typeof o === 'object' &&
-                o !== null &&
-                typeof o.id === 'string' &&
-                typeof o.summary === 'string' &&
-                !containsSecrets(`${o.title ?? ''}\n${o.summary}\n${o.inlineBody ?? ''}`) &&
-                !looksLikePromptInjection(`${o.title ?? ''}\n${o.summary}\n${o.inlineBody ?? ''}`));
-            const totalBytes = validOffers.reduce((acc, o) => acc + Buffer.byteLength(typeof o.inlineBody === 'string' ? o.inlineBody : o.summary, 'utf8'), 0);
-            return { offers: validOffers.slice(0, this.maxOffers), latencyMs: 0, tier: 'daemon_v2', totalBytes };
+            const seenRows = this.db
+                .prepare('SELECT entry_key FROM session_seen WHERE conversation_id = ?')
+                .all(conversationId);
+            const seen = new Set(seenRows.map((r) => String(r.entry_key)));
+            const offers = rawOffers.filter((o) => !seen.has(`${o.id}:${o.version}`) && !seen.has(o.id));
+            const totalBytes = offers.reduce((acc, o) => acc + Buffer.byteLength(typeof o.inlineBody === 'string' ? o.inlineBody : o.summary, 'utf8'), 0);
+            const tier = strategy === 'jev' ? 'forewisp_jev' : 'forewisp_lexical';
+            const latencyMs = Number((performance.now() - started).toFixed(2));
+            if (offers.length > 0) {
+                this.db
+                    .prepare(`INSERT INTO delivery_log (offer_id, conversation_id, query_text, selected_keys, injected_bytes, created_at, speed_tier, query_latency_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+                    .run(randomUUID(), conversationId, query.slice(0, 500), JSON.stringify(offers.map((c) => `${c.id}:${c.version}`)), totalBytes, Math.floor(Date.now() / 1000), tier, latencyMs);
+            }
+            return {
+                result: {
+                    offers,
+                    latencyMs,
+                    tier,
+                    strategy,
+                    daemonUnavailable: false,
+                    totalBytes,
+                },
+            };
         }
         catch {
-            return null;
+            return { unavailable: true };
         }
     }
     async retrieve(query, conversationId = 'default', opts) {
         const started = performance.now();
-        if (this.mode === 'daemon') {
-            const remote = await this.tryDaemonRetrieve(query, opts?.timeoutMs ?? 1500);
-            if (remote) {
-                remote.latencyMs = Number((performance.now() - started).toFixed(2));
-                return remote;
+        if (!query.trim()) {
+            return { offers: [], latencyMs: Number((performance.now() - started).toFixed(2)), tier: 'speed1_local', totalBytes: 0 };
+        }
+        let daemonUnavailable = false;
+        if (this.mode === 'daemon' || (this.mode === 'auto' && this.daemon)) {
+            const remote = await this.tryDaemonRetrieve(query, conversationId, opts?.timeoutMs ?? Math.max(this.turn1TimeoutMs, 2500));
+            if ('result' in remote) {
+                return remote.result;
             }
-            return { offers: [], latencyMs: Number((performance.now() - started).toFixed(2)), tier: 'daemon_v2', totalBytes: 0 };
+            daemonUnavailable = true;
+            if (this.mode === 'daemon') {
+                return {
+                    offers: [],
+                    latencyMs: Number((performance.now() - started).toFixed(2)),
+                    tier: 'forewisp_lexical',
+                    daemonUnavailable: true,
+                    totalBytes: 0,
+                };
+            }
         }
         const ftsQuery = buildFtsQuery(query);
         if (!ftsQuery) {
-            return { offers: [], latencyMs: Number((performance.now() - started).toFixed(2)), tier: 'speed1_local', totalBytes: 0 };
+            return {
+                offers: [],
+                latencyMs: Number((performance.now() - started).toFixed(2)),
+                tier: 'speed1_local',
+                ...(daemonUnavailable ? { daemonUnavailable: true } : {}),
+                totalBytes: 0,
+            };
         }
         const seenRows = this.db
             .prepare('SELECT entry_key FROM session_seen WHERE conversation_id = ?')
@@ -226,13 +271,6 @@ export class ForewispBridge {
         }
         catch {
             rawRows = [];
-        }
-        if (rawRows.length === 0 && this.mode === 'auto' && this.daemonUrl) {
-            const remote = await this.tryDaemonRetrieve(query, opts?.timeoutMs ?? Math.max(this.turn1TimeoutMs, 1200));
-            if (remote && remote.offers.length > 0) {
-                remote.latencyMs = Number((performance.now() - started).toFixed(2));
-                return remote;
-            }
         }
         const hasWikiConstraints = rawRows.some((r) => typeof r.wikitrace_json === 'string' && r.wikitrace_json !== '{}' && r.wikitrace_json.length > 2);
         const deps = hasWikiConstraints ? this.getDeps() : null;
@@ -326,20 +364,60 @@ export class ForewispBridge {
            VALUES (?, ?, ?, ?, ?, ?, 'speed1_local', ?)`)
                 .run(randomUUID(), conversationId, query.slice(0, 500), JSON.stringify(chosen.map((c) => `${c.id}:${c.version}`)), usedBytes, nowSec, latencyMs);
         }
-        return { offers: chosen, latencyMs, tier: 'speed1_local', totalBytes: usedBytes };
+        return {
+            offers: chosen,
+            latencyMs,
+            tier: 'speed1_local',
+            ...(daemonUnavailable ? { daemonUnavailable: true } : {}),
+            totalBytes: usedBytes,
+        };
     }
-    markPresented(conversationId, entryIds) {
+    markPresented(conversationId, entryIds, opts) {
         const nowSec = Math.floor(Date.now() / 1000);
         const stmt = this.db.prepare('INSERT OR IGNORE INTO session_seen (conversation_id, entry_key, presented_at) VALUES (?, ?, ?)');
-        for (const key of entryIds)
+        for (const key of entryIds) {
             stmt.run(conversationId, key, nowSec);
+            if (opts?.offerId) {
+                const bareId = key.includes(':') ? key.slice(0, key.lastIndexOf(':')) : key;
+                this.daemonOfferMeta.set(bareId, { conversationId, offerId: opts.offerId });
+                this.daemonOfferMeta.set(key, { conversationId, offerId: opts.offerId });
+            }
+        }
     }
     async expand(id, opts) {
         const row = this.db
             .prepare('SELECT * FROM entries WHERE id = ? AND withdrawn = 0')
             .get(id);
-        if (!row)
+        if (!row) {
+            if (this.mode !== 'local' && this.daemon) {
+                try {
+                    const remote = await this.daemon.expand(id);
+                    if (remote.found && typeof remote.content === 'string') {
+                        const bodyBuf = Buffer.from(remote.content, 'utf8');
+                        const offset = Math.max(0, Math.min(bodyBuf.length, opts?.offset ?? 0));
+                        const limit = Math.min(32768, Math.max(256, opts?.limit ?? 8192));
+                        let end = Math.min(bodyBuf.length, offset + limit);
+                        while (end > offset && end < bodyBuf.length && (bodyBuf[end] & 0xc0) === 0x80)
+                            end -= 1;
+                        let start = offset;
+                        while (start > 0 && start < bodyBuf.length && (bodyBuf[start] & 0xc0) === 0x80)
+                            start -= 1;
+                        return {
+                            found: true,
+                            stale: false,
+                            driftedFiles: [],
+                            content: bodyBuf.subarray(start, end).toString('utf8'),
+                            totalBytes: bodyBuf.length,
+                            version: remote.version ?? 1,
+                        };
+                    }
+                }
+                catch {
+                    return { found: false, stale: false, driftedFiles: [] };
+                }
+            }
             return { found: false, stale: false, driftedFiles: [] };
+        }
         const entry = this.rowToRecord(row);
         const driftedFiles = detectDriftedFiles(this.workspaceRoot, entry.sourceHashes);
         if (driftedFiles.length > 0 && opts?.allowStale !== true) {
@@ -426,7 +504,14 @@ export class ForewispBridge {
                     .run(deterministicId, req.title.trim(), req.summary.trim(), req.body.trim(), keywords);
                 this.db.exec('COMMIT');
                 inTx = false;
-                return { ok: true, status: 'updated', id: deterministicId, version: nextVer, recordSha256 };
+                const localOutcome = {
+                    ok: true,
+                    status: 'updated',
+                    id: deterministicId,
+                    version: nextVer,
+                    recordSha256,
+                };
+                return await this.syncUpsertToDaemon(req, localOutcome);
             }
             this.db
                 .prepare(`INSERT INTO entries (id, version, record_sha256, kind, title, summary, body, scope, keywords, source_hashes, wikitrace_json, updated_at)
@@ -437,7 +522,14 @@ export class ForewispBridge {
                 .run(deterministicId, req.title.trim(), req.summary.trim(), req.body.trim(), keywords);
             this.db.exec('COMMIT');
             inTx = false;
-            return { ok: true, status: 'inserted', id: deterministicId, version: 1, recordSha256 };
+            const localInsert = {
+                ok: true,
+                status: 'inserted',
+                id: deterministicId,
+                version: 1,
+                recordSha256,
+            };
+            return await this.syncUpsertToDaemon(req, localInsert);
         }
         catch (err) {
             if (inTx) {
@@ -449,13 +541,47 @@ export class ForewispBridge {
             throw err;
         }
     }
-    async feedback(id, helpful) {
+    async syncUpsertToDaemon(req, localOutcome) {
+        if (this.mode === 'local' || !this.daemon)
+            return localOutcome;
+        try {
+            const remote = await this.daemon.contribute(req);
+            return { ...localOutcome, daemonId: remote.id, daemonSynced: true };
+        }
+        catch (err) {
+            if (this.mode === 'daemon') {
+                return {
+                    ok: false,
+                    status: 'rejected',
+                    reason: err instanceof Error ? err.message : String(err),
+                };
+            }
+            return { ...localOutcome, daemonSynced: false };
+        }
+    }
+    async feedback(id, helpful, opts) {
         const col = helpful ? 'helpful' : 'harmful';
         this.db.prepare(`UPDATE entries SET ${col} = ${col} + 1 WHERE id = ? AND withdrawn = 0`).run(id);
         const row = this.db.prepare('SELECT helpful, harmful FROM entries WHERE id = ?').get(id);
-        if (!row)
-            return { ok: false, helpful: 0, harmful: 0 };
-        return { ok: true, helpful: Number(row.helpful), harmful: Number(row.harmful) };
+        let daemonRecorded;
+        const meta = opts?.conversationId && opts?.offerId ? opts : this.daemonOfferMeta.get(id);
+        if (this.mode !== 'local' && this.daemon && meta?.conversationId && meta?.offerId) {
+            try {
+                daemonRecorded = await this.daemon.feedback(meta.conversationId, meta.offerId, id, helpful ? 'useful' : 'dismissed');
+            }
+            catch {
+                daemonRecorded = false;
+            }
+        }
+        if (!row && !daemonRecorded) {
+            return { ok: false, helpful: 0, harmful: 0, ...(daemonRecorded !== undefined ? { daemonRecorded } : {}) };
+        }
+        return {
+            ok: Boolean(row || daemonRecorded),
+            helpful: Number(row?.helpful ?? (helpful ? 1 : 0)),
+            harmful: Number(row?.harmful ?? (helpful ? 0 : 1)),
+            ...(daemonRecorded !== undefined ? { daemonRecorded } : {}),
+        };
     }
     async stats() {
         const rows = this.db.prepare('SELECT source_hashes, withdrawn FROM entries').all();
@@ -471,7 +597,8 @@ export class ForewispBridge {
             }
         }
         const seen = this.db.prepare('SELECT COUNT(*) AS n FROM session_seen').get();
-        return { entries: rows.length, active, drifted, presentedCount: Number(seen?.n ?? 0) };
+        const daemon = await this.daemonHealth();
+        return { entries: rows.length, active, drifted, presentedCount: Number(seen?.n ?? 0), daemon };
     }
     close() {
         this.db.close();

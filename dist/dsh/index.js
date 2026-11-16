@@ -53,7 +53,6 @@ export function apply(ctx, rawConfig = {}) {
         return bridge;
     };
     const defaultBridge = getBridge(process.cwd());
-    ctx.provide('nsContext', defaultBridge);
     const states = new Map();
     const stateFor = (agent) => {
         const id = String(agent.session.id);
@@ -62,17 +61,39 @@ export function apply(ctx, rawConfig = {}) {
             st = {
                 agent,
                 conversationId: id,
+                forewispSessionId: `ns-${id}`.slice(0, 120),
                 coalescer: new ObservationCoalescer(),
                 activeOffers: [],
-                renderedKeys: [],
+                renderedMeta: [],
                 deferredWrites: [],
                 lastTurnError: false,
                 initialRetrieved: false,
+                eventSeq: 0,
+                sseStarted: false,
+                presentedAcked: new Set(),
+                lastTier: 'speed1_local',
+                daemonUnavailable: false,
+                totalOffersPresented: 0,
             };
             states.set(id, st);
         }
         return st;
     };
+    ctx.provide('nsContext', Object.assign(defaultBridge, {
+        getSessionSummary: (sessionId) => {
+            const st = states.get(sessionId);
+            if (!st)
+                return undefined;
+            return {
+                tier: st.lastTier,
+                strategy: st.lastStrategy,
+                daemonUnavailable: st.daemonUnavailable,
+                activeOffers: st.activeOffers.length,
+                totalOffersPresented: st.totalOffersPresented,
+                eventSeq: st.eventSeq,
+            };
+        },
+    }));
     const agentRoot = (agent) => {
         const meta = agent?.session?.meta;
         return typeof meta?.cwd === 'string' && meta.cwd.length > 0 ? meta.cwd : process.cwd();
@@ -89,17 +110,66 @@ export function apply(ctx, rawConfig = {}) {
             const st = states.get(String(agent.session.id));
             if (!st || st.activeOffers.length === 0) {
                 if (st)
-                    st.renderedKeys = [];
+                    st.renderedMeta = [];
                 return '';
             }
-            st.renderedKeys = st.activeOffers.map((o) => `${o.id}:${o.version}`);
+            st.renderedMeta = st.activeOffers.map((o) => ({
+                key: `${o.id}:${o.version}`,
+                id: o.id,
+                offerId: o.offerId,
+                sessionId: o.sessionId ?? st.forewispSessionId,
+            }));
             const lines = st.activeOffers.map((o) => {
                 const header = `[${o.id}@v${o.version} | ${o.kind}/${o.scope} | ${o.title}]`;
                 return `${header}\n${o.inlineBody ?? o.summary}`;
             });
-            return `<forewisp-context count="${st.activeOffers.length}">\n${lines.join('\n\n')}\n</forewisp-context>`;
+            const attrs = [
+                `count="${st.activeOffers.length}"`,
+                `tier="${st.lastTier}"`,
+                ...(st.lastStrategy ? [`strategy="${st.lastStrategy}"`] : []),
+            ].join(' ');
+            return `<forewisp-context ${attrs}>\n${lines.join('\n\n')}\n</forewisp-context>`;
         },
     });
+    const startOfferStream = (st, bridge) => {
+        const daemon = bridge.getDaemonClient();
+        if (!daemon || st.sseStarted || disposed)
+            return;
+        st.sseStarted = true;
+        st.sseAbort = new AbortController();
+        const signal = st.sseAbort.signal;
+        void (async () => {
+            try {
+                for await (const ev of daemon.offersStream(st.forewispSessionId, signal)) {
+                    if (disposed || signal.aborted)
+                        break;
+                    if (ev.sequence < st.eventSeq)
+                        continue;
+                    st.lastStrategy = ev.strategy;
+                    st.lastTier = ev.strategy === 'jev' ? 'forewisp_jev' : 'forewisp_lexical';
+                    st.daemonUnavailable = false;
+                    if (ev.entries.length > 0) {
+                        const existing = new Set(st.activeOffers.map((o) => `${o.id}:${o.version}`));
+                        const merged = [...st.activeOffers];
+                        for (const entry of ev.entries) {
+                            const key = `${entry.id}:${entry.version}`;
+                            if (!existing.has(key)) {
+                                existing.add(key);
+                                merged.push(entry);
+                            }
+                        }
+                        st.activeOffers = merged.slice(0, config.maxOffers);
+                    }
+                }
+            }
+            catch {
+                /* SSE closed or aborted cleanly */
+            }
+            finally {
+                st.sseStarted = false;
+            }
+        })();
+    };
     // Bounded Turn-1 retrieval BEFORE Step 1 prompt refresh & dispatch (fail-open).
     ctx.on('agent/pre-step', async (payload, next) => {
         const st = stateFor(payload.agent);
@@ -110,10 +180,31 @@ export function apply(ctx, rawConfig = {}) {
             const coalesced = st.coalescer.drainQuery();
             const query = [userPrompt, coalesced].filter(Boolean).join(' ').trim();
             if (query && (!st.initialRetrieved || coalesced)) {
-                const timeoutMs = st.initialRetrieved ? config.turn1TimeoutMs : Math.max(config.turn1TimeoutMs, 150);
+                const defaultTimeout = bridge.getDaemonClient() ? 2500 : 150;
+                const timeoutMs = st.initialRetrieved ? config.turn1TimeoutMs : Math.max(config.turn1TimeoutMs, defaultTimeout);
                 const res = await bridge.retrieve(query, st.conversationId, { timeoutMs });
                 st.initialRetrieved = true;
                 st.activeOffers = res.offers;
+                st.lastTier = res.tier;
+                st.lastStrategy = res.strategy;
+                st.daemonUnavailable = Boolean(res.daemonUnavailable);
+                const daemon = bridge.getDaemonClient();
+                if (daemon && config.mode !== 'local' && !res.daemonUnavailable) {
+                    const seq = (st.eventSeq += 1);
+                    void daemon
+                        .observeEvent(st.forewispSessionId, seq, query, {
+                        kinds: ['memory', 'skill', 'plugin'],
+                        timeoutMs: 2500,
+                    })
+                        .then((ack) => {
+                        if (ack.accepted && !st.sseStarted && !disposed) {
+                            startOfferStream(st, bridge);
+                        }
+                    })
+                        .catch(() => {
+                        /* non-blocking background offer stream */
+                    });
+                }
             }
             else if (!st.initialRetrieved) {
                 st.activeOffers = [];
@@ -129,12 +220,31 @@ export function apply(ctx, rawConfig = {}) {
         const rawSessionId = options.sessionId;
         if (rawSessionId !== undefined) {
             const st = states.get(String(rawSessionId));
-            if (st && st.renderedKeys.length > 0) {
+            if (st && st.renderedMeta.length > 0) {
+                const snapshot = st.renderedMeta.splice(0, st.renderedMeta.length);
                 try {
-                    getBridge(agentRoot(st.agent)).markPresented(st.conversationId, st.renderedKeys);
-                    st.renderedKeys = [];
+                    const bridge = getBridge(agentRoot(st.agent));
+                    const withOffer = snapshot.find((s) => s.offerId);
+                    bridge.markPresented(st.conversationId, snapshot.map((s) => s.key), withOffer ? { offerId: withOffer.offerId } : undefined);
+                    st.totalOffersPresented += snapshot.length;
+                    const daemon = bridge.getDaemonClient();
+                    if (daemon) {
+                        for (const item of snapshot) {
+                            if (!item.offerId)
+                                continue;
+                            const ackKey = `${item.offerId}:${item.id}`;
+                            if (st.presentedAcked.has(ackKey))
+                                continue;
+                            st.presentedAcked.add(ackKey);
+                            void daemon.feedback(item.sessionId, item.offerId, item.id, 'presented').catch(() => {
+                                /* best-effort transport receipt */
+                            });
+                        }
+                    }
                 }
-                catch { /* non-fatal telemetry receipt */ }
+                catch {
+                    /* non-fatal telemetry receipt */
+                }
             }
         }
         for await (const chunk of next())
@@ -217,7 +327,10 @@ export function apply(ctx, rawConfig = {}) {
         });
     }
     ctx.on('agent/disposed', ({ agent }) => {
-        states.delete(String(agent.session.id));
+        const sid = String(agent.session.id);
+        const st = states.get(sid);
+        st?.sseAbort?.abort();
+        states.delete(sid);
     });
     const schemaObj = { type: 'object', properties: {}, additionalProperties: true };
     ctx.tools.register(defineTool({
@@ -332,9 +445,14 @@ export function apply(ctx, rawConfig = {}) {
                     const q = rawInput.trim();
                     if (!q || q === 'stats') {
                         const st = await bridge.stats();
+                        const daemonTxt = st.daemon.configured
+                            ? st.daemon.reachable
+                                ? `daemon=${st.daemon.strategy ?? 'ok'}`
+                                : `daemon=unavailable (${st.daemon.error ?? 'offline'})`
+                            : 'daemon=unconfigured';
                         return {
                             kind: 'success',
-                            text: `Forewisp (${bridge.mode}): ${st.active} active / ${st.entries} total (${st.drifted} drifted, ${st.presentedCount} delivered).`,
+                            text: `Forewisp (${bridge.mode}, ${daemonTxt}): ${st.active} active / ${st.entries} total (${st.drifted} drifted, ${st.presentedCount} delivered).`,
                         };
                     }
                     const sid = agent?.session?.id ? String(agent.session.id) : 'slash';
@@ -358,6 +476,9 @@ export function apply(ctx, rawConfig = {}) {
         ctx.inject(['commands'], (subCtx) => registerSlash(subCtx.commands));
     ctx.effect(() => () => {
         disposed = true;
+        for (const st of states.values())
+            st.sseAbort?.abort();
+        states.clear();
         for (const bridge of bridgeCache.values())
             bridge.close();
         bridgeCache.clear();

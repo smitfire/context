@@ -192,3 +192,183 @@ test('DSH 0.2.2-rc.3 Cordis plugin mounts tools, pre-step context, and llm/strea
   await fiber.dispose();
   rmSync(dir, { recursive: true, force: true });
 });
+
+test('ForewispBridge integrates live v1/recall, JEV strategy, SSE offers, presented/useful feedback, and offline fallback', async () => {
+  const dir = makeTempRepo();
+  const feedbackCalls: Array<{ session_id: string; offer_id: number; entry_id: string; verdict: string }> = [];
+  const contributed: Array<Record<string, unknown>> = [];
+  let daemonDown = false;
+  let recallEmpty = false;
+
+  const mockFetch = (async (input: string | URL, init?: RequestInit) => {
+    if (daemonDown) throw new Error('ECONNREFUSED');
+    const url = typeof input === 'string' ? input : input.toString();
+    const path = new URL(url).pathname;
+
+    if (path === '/health') {
+      return new Response(JSON.stringify({ status: 'ok', strategy: 'jev', pilot: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (path === '/v1/recall') {
+      assert.equal(init?.method, 'POST');
+      assert.equal((init?.headers as Record<string, string>)?.authorization, 'Bearer test-secret-token-123');
+      if (recallEmpty) {
+        return new Response(JSON.stringify({ entries: [], strategy: 'jev' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          strategy: 'jev',
+          entries: [
+            {
+              id: 'jev-entry-1',
+              version: 2,
+              kind: 'memory',
+              title: 'Constant-time bearer check',
+              summary: 'Use timingSafeEqual after SHA-256 digest.',
+              scope: 'organization',
+              material_bytes: 42,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (path === '/v1/entries/jev-entry-1') {
+      return new Response(
+        JSON.stringify({ id: 'jev-entry-1', version: 2, content: 'Full timingSafeEqual guide body.' }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (path === '/v1/contributions') {
+      contributed.push(JSON.parse(String(init?.body ?? '{}')));
+      return new Response(
+        JSON.stringify({ entry: { id: 'contrib-1', version: 1 }, deduplicated: false }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (path === '/v1/events') {
+      return new Response(JSON.stringify({ accepted: true, sequence: 1 }), {
+        status: 202,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (path === '/v1/feedback') {
+      const payload = JSON.parse(String(init?.body ?? '{}')) as {
+        session_id: string;
+        offer_id: number;
+        entry_id: string;
+        verdict: string;
+      };
+      feedbackCalls.push(payload);
+      return new Response(JSON.stringify({ recorded: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (path.endsWith('/offers')) {
+      const sse = [
+        'event: offer',
+        'id: 7',
+        `data: ${JSON.stringify({
+          id: 7,
+          session_id: 'ns-sess-daemon',
+          sequence: 1,
+          strategy: 'jev',
+          entries: [
+            {
+              id: 'sse-entry-1',
+              version: 1,
+              kind: 'memory',
+              title: 'SSE delivered JEV memory',
+              summary: 'Injected via SSE step boundary.',
+              scope: 'organization',
+            },
+          ],
+        })}`,
+        '',
+        '',
+      ].join('\n');
+      return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    }
+    return new Response('not found', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const bridge = new ForewispBridge({
+    workspaceRoot: dir,
+    mode: 'auto',
+    daemonUrl: 'http://127.0.0.1:8797',
+    daemonToken: 'test-secret-token-123',
+    fetch: mockFetch,
+  });
+
+  try {
+    // Seed local FTS5 distractor that would match "bearer token" locally
+    await bridge.upsert({
+      kind: 'memory',
+      title: 'Local distractor bearer token note',
+      summary: 'Local note mentioning bearer token',
+      body: 'Local FTS5 distractor note about bearer token.',
+      keywords: 'bearer token',
+    });
+    assert.equal(contributed.length, 1);
+
+    // 1. Daemon health + JEV recall
+    const health = await bridge.daemonHealth();
+    assert.equal(health.reachable, true);
+    assert.equal(health.strategy, 'jev');
+
+    const res = await bridge.retrieve('validate bearer token', 'conv-jev');
+    assert.equal(res.tier, 'forewisp_jev');
+    assert.equal(res.strategy, 'jev');
+    assert.equal(res.daemonUnavailable, false);
+    assert.equal(res.offers.length, 1);
+    assert.equal(res.offers[0].id, 'jev-entry-1');
+
+    // 2. Authoritative empty JEV result must NOT fall back to local noisy FTS5
+    recallEmpty = true;
+    const emptyJev = await bridge.retrieve('validate bearer token', 'conv-jev-2');
+    assert.equal(emptyJev.tier, 'forewisp_jev');
+    assert.equal(emptyJev.daemonUnavailable, false);
+    assert.equal(emptyJev.offers.length, 0);
+    recallEmpty = false;
+
+    // 3. Remote expand via /v1/entries/:id
+    const exp = await bridge.expand('jev-entry-1');
+    assert.equal(exp.found, true);
+    assert.match(exp.content ?? '', /Full timingSafeEqual guide body/);
+
+    // 4. SSE offers stream parsing & feedback routing
+    const daemon = bridge.getDaemonClient()!;
+    const sseAbort = new AbortController();
+    const collected = [];
+    for await (const ev of daemon.offersStream('ns-sess-daemon', sseAbort.signal)) {
+      collected.push(ev);
+      sseAbort.abort();
+      break;
+    }
+    assert.equal(collected.length, 1);
+    assert.equal(collected[0].offerId, '7');
+    assert.equal(collected[0].entries[0].id, 'sse-entry-1');
+
+    bridge.markPresented('ns-sess-daemon', ['sse-entry-1:1'], { offerId: '7' });
+    const fb = await bridge.feedback('sse-entry-1', true);
+    assert.equal(fb.daemonRecorded, true);
+    assert.equal(feedbackCalls.at(-1)?.verdict, 'useful');
+    assert.equal(feedbackCalls.at(-1)?.offer_id, 7);
+
+    // 5. Daemon unreachable falls back to speed1_local and marks daemonUnavailable=true
+    daemonDown = true;
+    const fallback = await bridge.retrieve('bearer token', 'conv-offline');
+    assert.equal(fallback.tier, 'speed1_local');
+    assert.equal(fallback.daemonUnavailable, true);
+    assert.ok(fallback.offers.length >= 1);
+  } finally {
+    bridge.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
