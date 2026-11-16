@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { ForewispBridge, ObservationCoalescer, validateKnowledgeWrite, } from '../core/index.js';
@@ -12,6 +13,23 @@ export const Config = z.object({
     daemonTimeoutMs: z.number().default(2500),
 });
 const FOREWISP_SESSION_PREFIX = 'ns-';
+const MAX_STREAM_RECONNECTS = 5;
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_CAP_MS = 5000;
+const ACK_PRUNE_THRESHOLD = 128;
+const ACK_PRUNE_TARGET = 64;
+function buildForewispSessionId(conversationId) {
+    const raw = `${FOREWISP_SESSION_PREFIX}${conversationId}`;
+    if (raw.length <= 120)
+        return raw;
+    return `${FOREWISP_SESSION_PREFIX}${createHash('sha256').update(conversationId).digest('hex').slice(0, 32)}`;
+}
+function pickRetrieveTimeout(st, hasDaemon, config) {
+    if (hasDaemon) {
+        return st.initialRetrieved ? Math.min(config.daemonTimeoutMs, 600) : config.daemonTimeoutMs;
+    }
+    return st.initialRetrieved ? config.turn1TimeoutMs : Math.max(config.turn1TimeoutMs, 150);
+}
 function renderJsonText(_args, value) {
     return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }];
 }
@@ -34,7 +52,7 @@ function formatDaemonStatus(daemon) {
     return `daemon=unavailable (${daemon.error ?? 'offline'})`;
 }
 function pruneAckedForOffers(st) {
-    if (st.presentedAcked.size <= 128)
+    if (st.presentedAcked.size <= ACK_PRUNE_THRESHOLD)
         return;
     const activeIds = new Set(st.activeOffers.map((o) => o.id));
     for (const key of st.presentedAcked) {
@@ -42,7 +60,7 @@ function pruneAckedForOffers(st) {
         const entryId = colon >= 0 ? key.slice(colon + 1) : key;
         if (!activeIds.has(entryId))
             st.presentedAcked.delete(key);
-        if (st.presentedAcked.size <= 64)
+        if (st.presentedAcked.size <= ACK_PRUNE_TARGET)
             break;
     }
 }
@@ -78,14 +96,17 @@ export function apply(ctx, rawConfig = {}) {
     const defaultBridge = getBridge(process.cwd());
     const log = ctx.logger('ns-context');
     const states = new Map();
+    const forewispToConv = new Map();
     const stateFor = (agent) => {
         const id = String(agent.session.id);
         let st = states.get(id);
         if (!st) {
+            const fwId = buildForewispSessionId(id);
+            forewispToConv.set(fwId, id);
             st = {
                 agent,
                 conversationId: id,
-                forewispSessionId: `${FOREWISP_SESSION_PREFIX}${id}`.slice(0, 120),
+                forewispSessionId: fwId,
                 coalescer: new ObservationCoalescer(),
                 activeOffers: [],
                 renderedMeta: [],
@@ -117,11 +138,14 @@ export function apply(ctx, rawConfig = {}) {
         const direct = states.get(sessionId);
         if (direct)
             return summaryFor(direct);
+        const mapped = forewispToConv.get(sessionId);
+        if (mapped && states.has(mapped))
+            return summaryFor(states.get(mapped));
         const stripped = sessionId.startsWith(FOREWISP_SESSION_PREFIX)
             ? sessionId.slice(FOREWISP_SESSION_PREFIX.length)
             : sessionId;
-        const byForewispId = states.get(stripped) ?? Array.from(states.values()).find((item) => item.forewispSessionId === sessionId);
-        return byForewispId ? summaryFor(byForewispId) : undefined;
+        const found = states.get(stripped);
+        return found ? summaryFor(found) : undefined;
     };
     const providedService = {
         get mode() {
@@ -213,7 +237,7 @@ export function apply(ctx, rawConfig = {}) {
                         if (disposed || signal.aborted || states.get(st.conversationId) !== st)
                             break;
                         reconnects += 1;
-                        if (reconnects > 5)
+                        if (reconnects > MAX_STREAM_RECONNECTS)
                             break;
                     }
                     catch (err) {
@@ -222,11 +246,11 @@ export function apply(ctx, rawConfig = {}) {
                         st.daemonUnavailable = true;
                         log.warn(`Forewisp offer stream error for ${st.forewispSessionId}: ${err instanceof Error ? err.message : String(err)}`);
                         reconnects += 1;
-                        if (reconnects > 5)
+                        if (reconnects > MAX_STREAM_RECONNECTS)
                             break;
                     }
                     await new Promise((resolveDelay) => {
-                        const delayMs = Math.min(5000, 500 * 2 ** (reconnects - 1));
+                        const delayMs = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** (reconnects - 1));
                         const t = setTimeout(resolveDelay, delayMs);
                         signal.addEventListener('abort', () => {
                             clearTimeout(t);
@@ -236,8 +260,9 @@ export function apply(ctx, rawConfig = {}) {
                 }
             }
             finally {
-                if (!disposed && st.sseAbort === controller) {
+                if (st.sseAbort === controller) {
                     st.sseStarted = false;
+                    st.sseAbort = undefined;
                 }
             }
         })();
@@ -254,13 +279,7 @@ export function apply(ctx, rawConfig = {}) {
             const query = [userPrompt, coalesced].filter(Boolean).join(' ').trim();
             if (query && (!st.initialRetrieved || coalesced)) {
                 const hasDaemon = Boolean(bridge.getDaemonClient());
-                const timeoutMs = hasDaemon
-                    ? st.initialRetrieved
-                        ? Math.min(config.daemonTimeoutMs, 600)
-                        : config.daemonTimeoutMs
-                    : st.initialRetrieved
-                        ? config.turn1TimeoutMs
-                        : Math.max(config.turn1TimeoutMs, 150);
+                const timeoutMs = pickRetrieveTimeout(st, hasDaemon, config);
                 const res = await bridge.retrieve(query, st.conversationId, { timeoutMs });
                 if (st.retrievalEpoch === myEpoch) {
                     st.initialRetrieved = true;
@@ -334,8 +353,14 @@ export function apply(ctx, rawConfig = {}) {
                             if (st.presentedAcked.has(ackKey))
                                 continue;
                             st.presentedAcked.add(ackKey);
-                            void daemon.feedback(item.sessionId, item.offerId, item.id, 'presented').catch(() => {
-                                /* best-effort transport receipt */
+                            void daemon
+                                .feedback(item.sessionId, item.offerId, item.id, 'presented')
+                                .then((ok) => {
+                                if (!ok)
+                                    st.presentedAcked.delete(ackKey);
+                            })
+                                .catch(() => {
+                                st.presentedAcked.delete(ackKey);
                             });
                         }
                     }
@@ -426,7 +451,10 @@ export function apply(ctx, rawConfig = {}) {
     ctx.on('agent/disposed', ({ agent }) => {
         const sid = String(agent.session.id);
         const st = states.get(sid);
-        st?.sseAbort?.abort();
+        if (st) {
+            forewispToConv.delete(st.forewispSessionId);
+            st.sseAbort?.abort();
+        }
         states.delete(sid);
     });
     const schemaObj = { type: 'object', properties: {}, additionalProperties: true };
@@ -574,6 +602,7 @@ export function apply(ctx, rawConfig = {}) {
         for (const st of states.values())
             st.sseAbort?.abort();
         states.clear();
+        forewispToConv.clear();
         for (const bridge of bridgeCache.values())
             bridge.close();
         bridgeCache.clear();

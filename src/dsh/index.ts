@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -69,6 +70,28 @@ interface AgentSessionState {
 }
 
 const FOREWISP_SESSION_PREFIX = 'ns-';
+const MAX_STREAM_RECONNECTS = 5;
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_CAP_MS = 5000;
+const ACK_PRUNE_THRESHOLD = 128;
+const ACK_PRUNE_TARGET = 64;
+
+function buildForewispSessionId(conversationId: string): string {
+  const raw = `${FOREWISP_SESSION_PREFIX}${conversationId}`;
+  if (raw.length <= 120) return raw;
+  return `${FOREWISP_SESSION_PREFIX}${createHash('sha256').update(conversationId).digest('hex').slice(0, 32)}`;
+}
+
+function pickRetrieveTimeout(
+  st: { initialRetrieved: boolean },
+  hasDaemon: boolean,
+  config: { turn1TimeoutMs: number; daemonTimeoutMs: number },
+): number {
+  if (hasDaemon) {
+    return st.initialRetrieved ? Math.min(config.daemonTimeoutMs, 600) : config.daemonTimeoutMs;
+  }
+  return st.initialRetrieved ? config.turn1TimeoutMs : Math.max(config.turn1TimeoutMs, 150);
+}
 
 function renderJsonText(_args: unknown, value: unknown) {
   return [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value) }];
@@ -94,13 +117,13 @@ function formatDaemonStatus(daemon: DaemonHealthStatus): string {
 }
 
 function pruneAckedForOffers(st: AgentSessionState): void {
-  if (st.presentedAcked.size <= 128) return;
+  if (st.presentedAcked.size <= ACK_PRUNE_THRESHOLD) return;
   const activeIds = new Set(st.activeOffers.map((o) => o.id));
   for (const key of st.presentedAcked) {
     const colon = key.indexOf(':');
     const entryId = colon >= 0 ? key.slice(colon + 1) : key;
     if (!activeIds.has(entryId)) st.presentedAcked.delete(key);
-    if (st.presentedAcked.size <= 64) break;
+    if (st.presentedAcked.size <= ACK_PRUNE_TARGET) break;
   }
 }
 
@@ -138,14 +161,17 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   const log = ctx.logger('ns-context');
 
   const states = new Map<string, AgentSessionState>();
+  const forewispToConv = new Map<string, string>();
   const stateFor = (agent: Agent): AgentSessionState => {
     const id = String(agent.session.id);
     let st = states.get(id);
     if (!st) {
+      const fwId = buildForewispSessionId(id);
+      forewispToConv.set(fwId, id);
       st = {
         agent,
         conversationId: id,
-        forewispSessionId: `${FOREWISP_SESSION_PREFIX}${id}`.slice(0, 120),
+        forewispSessionId: fwId,
         coalescer: new ObservationCoalescer(),
         activeOffers: [],
         renderedMeta: [],
@@ -178,12 +204,13 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   const getSessionSummary = (sessionId: string): SessionContextSummary | undefined => {
     const direct = states.get(sessionId);
     if (direct) return summaryFor(direct);
+    const mapped = forewispToConv.get(sessionId);
+    if (mapped && states.has(mapped)) return summaryFor(states.get(mapped)!);
     const stripped = sessionId.startsWith(FOREWISP_SESSION_PREFIX)
       ? sessionId.slice(FOREWISP_SESSION_PREFIX.length)
       : sessionId;
-    const byForewispId =
-      states.get(stripped) ?? Array.from(states.values()).find((item) => item.forewispSessionId === sessionId);
-    return byForewispId ? summaryFor(byForewispId) : undefined;
+    const found = states.get(stripped);
+    return found ? summaryFor(found) : undefined;
   };
 
   const providedService: NsContextService = {
@@ -271,7 +298,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             }
             if (disposed || signal.aborted || states.get(st.conversationId) !== st) break;
             reconnects += 1;
-            if (reconnects > 5) break;
+            if (reconnects > MAX_STREAM_RECONNECTS) break;
           } catch (err) {
             if (disposed || signal.aborted || states.get(st.conversationId) !== st) break;
             st.daemonUnavailable = true;
@@ -279,10 +306,10 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               `Forewisp offer stream error for ${st.forewispSessionId}: ${err instanceof Error ? err.message : String(err)}`,
             );
             reconnects += 1;
-            if (reconnects > 5) break;
+            if (reconnects > MAX_STREAM_RECONNECTS) break;
           }
           await new Promise<void>((resolveDelay) => {
-            const delayMs = Math.min(5000, 500 * 2 ** (reconnects - 1));
+            const delayMs = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** (reconnects - 1));
             const t = setTimeout(resolveDelay, delayMs);
             signal.addEventListener('abort', () => {
               clearTimeout(t);
@@ -291,8 +318,9 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
           });
         }
       } finally {
-        if (!disposed && st.sseAbort === controller) {
+        if (st.sseAbort === controller) {
           st.sseStarted = false;
+          st.sseAbort = undefined;
         }
       }
     })();
@@ -311,13 +339,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
 
       if (query && (!st.initialRetrieved || coalesced)) {
         const hasDaemon = Boolean(bridge.getDaemonClient());
-        const timeoutMs = hasDaemon
-          ? st.initialRetrieved
-            ? Math.min(config.daemonTimeoutMs, 600)
-            : config.daemonTimeoutMs
-          : st.initialRetrieved
-            ? config.turn1TimeoutMs
-            : Math.max(config.turn1TimeoutMs, 150);
+        const timeoutMs = pickRetrieveTimeout(st, hasDaemon, config);
         const res = await bridge.retrieve(query, st.conversationId, { timeoutMs });
         if (st.retrievalEpoch === myEpoch) {
           st.initialRetrieved = true;
@@ -385,9 +407,14 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               const ackKey = `${item.offerId}:${item.id}`;
               if (st.presentedAcked.has(ackKey)) continue;
               st.presentedAcked.add(ackKey);
-              void daemon.feedback(item.sessionId, item.offerId, item.id, 'presented').catch(() => {
-                /* best-effort transport receipt */
-              });
+              void daemon
+                .feedback(item.sessionId, item.offerId, item.id, 'presented')
+                .then((ok) => {
+                  if (!ok) st.presentedAcked.delete(ackKey);
+                })
+                .catch(() => {
+                  st.presentedAcked.delete(ackKey);
+                });
             }
           }
         } catch (err) {
@@ -473,7 +500,10 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   ctx.on('agent/disposed', ({ agent }) => {
     const sid = String(agent.session.id);
     const st = states.get(sid);
-    st?.sseAbort?.abort();
+    if (st) {
+      forewispToConv.delete(st.forewispSessionId);
+      st.sseAbort?.abort();
+    }
     states.delete(sid);
   });
 
@@ -631,6 +661,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     disposed = true;
     for (const st of states.values()) st.sseAbort?.abort();
     states.clear();
+    forewispToConv.clear();
     for (const bridge of bridgeCache.values()) bridge.close();
     bridgeCache.clear();
   });

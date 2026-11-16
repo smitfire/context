@@ -11,11 +11,14 @@ export declare class ForewispBridge implements NsContextService {
     private readonly turn1TimeoutMs;
     private readonly daemon?;
     private readonly daemonOfferMeta;
+    private cachedHealth?;
     private readonly db;
     private cachedDeps?;
     constructor(options: ContextBridgeOptions);
     getDaemonClient(): ForewispDaemonClient | undefined;
-    daemonHealth(): Promise<DaemonHealthStatus>;
+    daemonHealth(opts?: {
+        refresh?: boolean;
+    }): Promise<DaemonHealthStatus>;
     private openDatabase;
     private safeJsonParse;
     private getDeps;

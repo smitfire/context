@@ -34,6 +34,7 @@ export class ForewispBridge {
     turn1TimeoutMs;
     daemon;
     daemonOfferMeta = new Map();
+    cachedHealth;
     db;
     cachedDeps;
     constructor(options) {
@@ -62,11 +63,17 @@ export class ForewispBridge {
     getDaemonClient() {
         return this.daemon;
     }
-    async daemonHealth() {
+    async daemonHealth(opts) {
         if (!this.daemon) {
             return { configured: Boolean(this.daemonUrl), reachable: false };
         }
-        return this.daemon.health();
+        const now = Date.now();
+        if (!opts?.refresh && this.cachedHealth && now - this.cachedHealth.at < 5000) {
+            return this.cachedHealth.status;
+        }
+        const status = await this.daemon.health(500);
+        this.cachedHealth = { status, at: Date.now() };
+        return status;
     }
     openDatabase() {
         const dir = dirname(this.dbPath);
@@ -96,7 +103,8 @@ export class ForewispBridge {
         helpful INTEGER NOT NULL DEFAULT 1,
         harmful INTEGER NOT NULL DEFAULT 0,
         withdrawn INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        daemon_synced INTEGER NOT NULL DEFAULT 0
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
         id UNINDEXED,
@@ -126,6 +134,9 @@ export class ForewispBridge {
         const cols = db.prepare('PRAGMA table_info(entries)').all();
         if (!cols.some((c) => c.name === 'record_sha256')) {
             db.exec("ALTER TABLE entries ADD COLUMN record_sha256 TEXT NOT NULL DEFAULT ''");
+        }
+        if (!cols.some((c) => c.name === 'daemon_synced')) {
+            db.exec('ALTER TABLE entries ADD COLUMN daemon_synced INTEGER NOT NULL DEFAULT 0');
         }
         const verRow = db.prepare('PRAGMA user_version').get();
         if ((verRow?.user_version ?? 0) < LOCAL_SCHEMA_VERSION) {
@@ -228,20 +239,32 @@ export class ForewispBridge {
             return { offers: [], latencyMs: Number((performance.now() - started).toFixed(2)), tier: 'speed1_local', totalBytes: 0 };
         }
         let daemonUnavailable = false;
+        let onlyUnsyncedLocal = false;
         if (this.mode === 'daemon' || (this.mode === 'auto' && this.daemon)) {
             const remote = await this.tryDaemonRetrieve(query, conversationId, opts?.timeoutMs ?? Math.max(this.turn1TimeoutMs, 2500));
             if ('result' in remote) {
-                return remote.result;
+                if (remote.result.offers.length > 0 || this.mode === 'daemon') {
+                    return remote.result;
+                }
+                // When JEV returns 0 offers in auto mode, respect its negative judgment for daemon-synced entries
+                // and only inspect local entries that have never been synced to the daemon.
+                const unsyncedCount = this.db.prepare('SELECT COUNT(*) AS n FROM entries WHERE withdrawn = 0 AND daemon_synced = 0').get().n;
+                if (unsyncedCount === 0) {
+                    return remote.result;
+                }
+                onlyUnsyncedLocal = true;
             }
-            daemonUnavailable = true;
-            if (this.mode === 'daemon') {
-                return {
-                    offers: [],
-                    latencyMs: Number((performance.now() - started).toFixed(2)),
-                    tier: 'forewisp_lexical',
-                    daemonUnavailable: true,
-                    totalBytes: 0,
-                };
+            else {
+                daemonUnavailable = true;
+                if (this.mode === 'daemon') {
+                    return {
+                        offers: [],
+                        latencyMs: Number((performance.now() - started).toFixed(2)),
+                        tier: 'forewisp_lexical',
+                        daemonUnavailable: true,
+                        totalBytes: 0,
+                    };
+                }
             }
         }
         const ftsQuery = buildFtsQuery(query);
@@ -260,14 +283,20 @@ export class ForewispBridge {
         const seen = new Set(seenRows.map((r) => `${r.entry_key}`));
         let rawRows = [];
         try {
-            rawRows = this.db
-                .prepare(`SELECT e.*, -bm25(entries_fts, 3.0, 2.0, 1.0, 2.5) AS fts_score
+            const sql = onlyUnsyncedLocal
+                ? `SELECT e.*, -bm25(entries_fts, 3.0, 2.0, 1.0, 2.5) AS fts_score
+           FROM entries_fts f
+           JOIN entries e ON e.id = f.id
+           WHERE entries_fts MATCH ? AND e.withdrawn = 0 AND e.daemon_synced = 0
+           ORDER BY fts_score DESC
+           LIMIT 32`
+                : `SELECT e.*, -bm25(entries_fts, 3.0, 2.0, 1.0, 2.5) AS fts_score
            FROM entries_fts f
            JOIN entries e ON e.id = f.id
            WHERE entries_fts MATCH ? AND e.withdrawn = 0
            ORDER BY fts_score DESC
-           LIMIT 32`)
-                .all(ftsQuery);
+           LIMIT 32`;
+            rawRows = this.db.prepare(sql).all(ftsQuery);
         }
         catch {
             rawRows = [];
@@ -557,9 +586,9 @@ export class ForewispBridge {
     async syncUpsertToDaemon(req, localOutcome, priorRecord) {
         if (this.mode === 'local' || !this.daemon)
             return localOutcome;
+        let remote;
         try {
-            const remote = await this.daemon.contribute(req);
-            return { ...localOutcome, daemonId: remote.id, daemonSynced: true };
+            remote = await this.daemon.contribute(req);
         }
         catch (err) {
             if (this.mode === 'daemon' && localOutcome.id) {
@@ -599,6 +628,10 @@ export class ForewispBridge {
             }
             return { ...localOutcome, daemonSynced: false };
         }
+        if (localOutcome.id) {
+            this.db.prepare('UPDATE entries SET daemon_synced = 1 WHERE id = ?').run(localOutcome.id);
+        }
+        return { ...localOutcome, daemonId: remote.id, daemonSynced: true };
     }
     async feedback(id, helpful, opts) {
         if (helpful) {

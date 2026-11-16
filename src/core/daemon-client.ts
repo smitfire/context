@@ -327,17 +327,25 @@ export class ForewispDaemonClient {
         if (done) break;
         const chunk = decoder.decode(value, { stream: true }).replaceAll('\r', '');
         if (!chunk) continue;
-        scanFrom = Math.max(0, buffer.length - 1);
+        const prevLen = buffer.length;
         buffer += chunk;
-        if (buffer.length > 256_000) throw new Error('Forewisp SSE frame exceeded 256KB');
+        scanFrom = Math.max(0, prevLen - 1);
+        if (buffer.length > 256_000) {
+          // Discard oversized corrupted buffer rather than crashing the long-lived SSE stream.
+          buffer = '';
+          scanFrom = 0;
+          continue;
+        }
         let boundary: number;
         while ((boundary = buffer.indexOf('\n\n', scanFrom)) >= 0) {
           const frame = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
           scanFrom = 0;
           const lines = frame.split('\n');
-          const eventType = lines.find((l) => l.startsWith('event:'))?.slice(6).trim();
-          const id = lines.find((l) => l.startsWith('id:'))?.slice(3).trim();
+          const eventLine = lines.find((l) => l === 'event:' || l.startsWith('event: '));
+          const idLine = lines.find((l) => l === 'id:' || l.startsWith('id: '));
+          const eventType = eventLine ? eventLine.slice(6).trim() : '';
+          const id = idLine ? idLine.slice(3).trim() : '';
           if (eventType !== 'offer' || !id || !/^\d+$/.test(id)) continue;
           const dataStr = lines
             .filter((l) => l.startsWith('data:'))
