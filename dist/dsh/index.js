@@ -224,9 +224,11 @@ export function apply(ctx, rawConfig = {}) {
                             st.lastStrategy = ev.strategy;
                             st.lastTier = ev.strategy === 'jev' ? 'forewisp_jev' : 'forewisp_lexical';
                             st.daemonUnavailable = false;
-                            // Replace active offer set per authoritative SSE event so stale retrieval offers retire cleanly.
-                            st.activeOffers = ev.entries.slice(0, config.maxOffers);
-                            pruneAckedForOffers(st);
+                            // Replace active offer set when the SSE event yields non-empty offers so an empty/error pulse doesn't wipe Turn-1 offers.
+                            if (ev.entries.length > 0) {
+                                st.activeOffers = ev.entries.slice(0, config.maxOffers);
+                                pruneAckedForOffers(st);
+                            }
                         }
                         if (disposed || signal.aborted || states.get(st.conversationId) !== st)
                             break;
