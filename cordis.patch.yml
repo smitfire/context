@@ -1,0 +1,3 @@
+- insert:
+    - id: ns-context
+      name: '@smitfire/context'
