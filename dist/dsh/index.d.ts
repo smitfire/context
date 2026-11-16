@@ -9,6 +9,7 @@ export interface PluginConfig {
     inlineBytes: number;
     maxOffers: number;
     turn1TimeoutMs: number;
+    daemonTimeoutMs?: number;
 }
 export declare const Config: z<PluginConfig>;
 declare module '@deepseek-ai/cordis' {

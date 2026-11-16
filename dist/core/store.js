@@ -379,10 +379,33 @@ export class ForewispBridge {
             stmt.run(conversationId, key, nowSec);
             if (opts?.offerId) {
                 const bareId = key.includes(':') ? key.slice(0, key.lastIndexOf(':')) : key;
-                this.daemonOfferMeta.set(bareId, { conversationId, offerId: opts.offerId });
-                this.daemonOfferMeta.set(key, { conversationId, offerId: opts.offerId });
+                const meta = { conversationId, offerId: opts.offerId };
+                this.daemonOfferMeta.set(bareId, meta);
+                this.daemonOfferMeta.set(key, meta);
+                while (this.daemonOfferMeta.size > 500) {
+                    const oldest = this.daemonOfferMeta.keys().next().value;
+                    if (oldest === undefined)
+                        break;
+                    this.daemonOfferMeta.delete(oldest);
+                }
             }
         }
+    }
+    pageUtf8(text, opts) {
+        const bodyBuf = Buffer.from(text, 'utf8');
+        const offset = Math.max(0, Math.min(bodyBuf.length, opts?.offset ?? 0));
+        const limit = Math.min(32768, Math.max(256, opts?.limit ?? 8192));
+        // Avoid splitting UTF-8 multi-byte sequences on page boundaries.
+        let end = Math.min(bodyBuf.length, offset + limit);
+        while (end > offset && end < bodyBuf.length && (bodyBuf[end] & 0xc0) === 0x80)
+            end -= 1;
+        let start = offset;
+        while (start > 0 && start < bodyBuf.length && (bodyBuf[start] & 0xc0) === 0x80)
+            start -= 1;
+        return {
+            content: bodyBuf.subarray(start, end).toString('utf8'),
+            totalBytes: bodyBuf.length,
+        };
     }
     async expand(id, opts) {
         const row = this.db
@@ -393,27 +416,23 @@ export class ForewispBridge {
                 try {
                     const remote = await this.daemon.expand(id);
                     if (remote.found && typeof remote.content === 'string') {
-                        const bodyBuf = Buffer.from(remote.content, 'utf8');
-                        const offset = Math.max(0, Math.min(bodyBuf.length, opts?.offset ?? 0));
-                        const limit = Math.min(32768, Math.max(256, opts?.limit ?? 8192));
-                        let end = Math.min(bodyBuf.length, offset + limit);
-                        while (end > offset && end < bodyBuf.length && (bodyBuf[end] & 0xc0) === 0x80)
-                            end -= 1;
-                        let start = offset;
-                        while (start > 0 && start < bodyBuf.length && (bodyBuf[start] & 0xc0) === 0x80)
-                            start -= 1;
+                        if (containsSecrets(remote.content) || looksLikePromptInjection(remote.content)) {
+                            return { found: false, stale: false, driftedFiles: [] };
+                        }
+                        const paged = this.pageUtf8(remote.content, opts);
                         return {
                             found: true,
                             stale: false,
                             driftedFiles: [],
-                            content: bodyBuf.subarray(start, end).toString('utf8'),
-                            totalBytes: bodyBuf.length,
+                            content: paged.content,
+                            totalBytes: paged.totalBytes,
                             version: remote.version ?? 1,
                         };
                     }
+                    return { found: false, stale: false, driftedFiles: [] };
                 }
                 catch {
-                    return { found: false, stale: false, driftedFiles: [] };
+                    return { found: false, stale: false, driftedFiles: [], daemonUnavailable: true };
                 }
             }
             return { found: false, stale: false, driftedFiles: [] };
@@ -429,22 +448,13 @@ export class ForewispBridge {
                 recordSha256: entry.recordSha256,
             };
         }
-        const bodyBuf = Buffer.from(entry.body, 'utf8');
-        const offset = Math.max(0, Math.min(bodyBuf.length, opts?.offset ?? 0));
-        const limit = Math.min(32768, Math.max(256, opts?.limit ?? 8192));
-        // Avoid splitting UTF-8 multi-byte sequences on page boundaries.
-        let end = Math.min(bodyBuf.length, offset + limit);
-        while (end > offset && end < bodyBuf.length && (bodyBuf[end] & 0xc0) === 0x80)
-            end -= 1;
-        let start = offset;
-        while (start > 0 && start < bodyBuf.length && (bodyBuf[start] & 0xc0) === 0x80)
-            start -= 1;
+        const paged = this.pageUtf8(entry.body, opts);
         return {
             found: true,
             stale: driftedFiles.length > 0,
             driftedFiles,
-            content: bodyBuf.subarray(start, end).toString('utf8'),
-            totalBytes: bodyBuf.length,
+            content: paged.content,
+            totalBytes: paged.totalBytes,
             version: entry.version,
             recordSha256: entry.recordSha256,
         };
@@ -470,6 +480,40 @@ export class ForewispBridge {
         const deterministicId = req.id?.trim() ||
             `wisp_${createHash('sha256').update(`${req.kind}:${scope}:${req.title.trim()}`).digest('hex').slice(0, 12)}`;
         const nowSec = Math.floor(Date.now() / 1000);
+        // In strict daemon mode, require the daemon contribution to succeed before committing locally.
+        let preSyncedDaemonId;
+        if (this.mode === 'daemon') {
+            if (!this.daemon) {
+                return { ok: false, status: 'rejected', reason: 'Forewisp daemon client is not configured' };
+            }
+            const existingCheck = this.db
+                .prepare('SELECT * FROM entries WHERE id = ?')
+                .get(deterministicId);
+            if (existingCheck) {
+                const current = this.rowToRecord(existingCheck);
+                if ((req.baseRevision !== undefined && req.baseRevision !== current.version) ||
+                    (req.baseRecordSha256 !== undefined && req.baseRecordSha256 !== current.recordSha256)) {
+                    return {
+                        ok: false,
+                        status: 'conflict',
+                        id: current.id,
+                        version: current.version,
+                        recordSha256: current.recordSha256,
+                        reason: `knowledge_revision_conflict: expected v${req.baseRevision ?? '?'} (${req.baseRecordSha256 ?? '?'})`,
+                    };
+                }
+            }
+            try {
+                preSyncedDaemonId = (await this.daemon.contribute(req)).id;
+            }
+            catch (err) {
+                return {
+                    ok: false,
+                    status: 'rejected',
+                    reason: err instanceof Error ? err.message : String(err),
+                };
+            }
+        }
         this.db.exec('BEGIN IMMEDIATE');
         let inTx = true;
         try {
@@ -510,8 +554,9 @@ export class ForewispBridge {
                     id: deterministicId,
                     version: nextVer,
                     recordSha256,
+                    ...(preSyncedDaemonId ? { daemonId: preSyncedDaemonId, daemonSynced: true } : {}),
                 };
-                return await this.syncUpsertToDaemon(req, localOutcome);
+                return preSyncedDaemonId ? localOutcome : await this.syncUpsertToDaemon(req, localOutcome);
             }
             this.db
                 .prepare(`INSERT INTO entries (id, version, record_sha256, kind, title, summary, body, scope, keywords, source_hashes, wikitrace_json, updated_at)
@@ -528,8 +573,9 @@ export class ForewispBridge {
                 id: deterministicId,
                 version: 1,
                 recordSha256,
+                ...(preSyncedDaemonId ? { daemonId: preSyncedDaemonId, daemonSynced: true } : {}),
             };
-            return await this.syncUpsertToDaemon(req, localInsert);
+            return preSyncedDaemonId ? localInsert : await this.syncUpsertToDaemon(req, localInsert);
         }
         catch (err) {
             if (inTx) {
@@ -548,20 +594,17 @@ export class ForewispBridge {
             const remote = await this.daemon.contribute(req);
             return { ...localOutcome, daemonId: remote.id, daemonSynced: true };
         }
-        catch (err) {
-            if (this.mode === 'daemon') {
-                return {
-                    ok: false,
-                    status: 'rejected',
-                    reason: err instanceof Error ? err.message : String(err),
-                };
-            }
+        catch {
             return { ...localOutcome, daemonSynced: false };
         }
     }
     async feedback(id, helpful, opts) {
-        const col = helpful ? 'helpful' : 'harmful';
-        this.db.prepare(`UPDATE entries SET ${col} = ${col} + 1 WHERE id = ? AND withdrawn = 0`).run(id);
+        if (helpful) {
+            this.db.prepare('UPDATE entries SET helpful = helpful + 1 WHERE id = ? AND withdrawn = 0').run(id);
+        }
+        else {
+            this.db.prepare('UPDATE entries SET harmful = harmful + 1 WHERE id = ? AND withdrawn = 0').run(id);
+        }
         const row = this.db.prepare('SELECT helpful, harmful FROM entries WHERE id = ?').get(id);
         let daemonRecorded;
         const meta = opts?.conversationId && opts?.offerId ? opts : this.daemonOfferMeta.get(id);
@@ -574,12 +617,13 @@ export class ForewispBridge {
             }
         }
         if (!row && !daemonRecorded) {
-            return { ok: false, helpful: 0, harmful: 0, ...(daemonRecorded !== undefined ? { daemonRecorded } : {}) };
+            return { ok: false, helpful: 0, harmful: 0, localFound: false, ...(daemonRecorded !== undefined ? { daemonRecorded } : {}) };
         }
         return {
             ok: Boolean(row || daemonRecorded),
-            helpful: Number(row?.helpful ?? (helpful ? 1 : 0)),
-            harmful: Number(row?.harmful ?? (helpful ? 0 : 1)),
+            helpful: row ? Number(row.helpful) : 0,
+            harmful: row ? Number(row.harmful) : 0,
+            localFound: Boolean(row),
             ...(daemonRecorded !== undefined ? { daemonRecorded } : {}),
         };
     }
@@ -601,6 +645,7 @@ export class ForewispBridge {
         return { entries: rows.length, active, drifted, presentedCount: Number(seen?.n ?? 0), daemon };
     }
     close() {
+        this.daemonOfferMeta.clear();
         this.db.close();
     }
 }

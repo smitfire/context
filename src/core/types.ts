@@ -121,6 +121,15 @@ export interface DaemonHealthStatus {
   error?: string;
 }
 
+export interface SessionContextSummary {
+  tier: string;
+  strategy?: string;
+  daemonUnavailable: boolean;
+  activeOffers: number;
+  totalOffersPresented: number;
+  eventSeq: number;
+}
+
 export interface NsContextService {
   readonly mode: ContextMode;
   retrieve(query: string, conversationId?: string, opts?: { timeoutMs?: number }): Promise<RetrievalResult>;
@@ -128,6 +137,7 @@ export interface NsContextService {
     found: boolean;
     stale: boolean;
     driftedFiles: string[];
+    daemonUnavailable?: boolean;
     content?: string;
     totalBytes?: number;
     version?: number;
@@ -138,7 +148,7 @@ export interface NsContextService {
     id: string,
     helpful: boolean,
     opts?: { conversationId?: string; offerId?: string },
-  ): Promise<{ ok: boolean; helpful: number; harmful: number; daemonRecorded?: boolean }>;
+  ): Promise<{ ok: boolean; helpful: number; harmful: number; daemonRecorded?: boolean; localFound?: boolean }>;
   markPresented(conversationId: string, entryIds: readonly string[], opts?: { offerId?: string }): void;
   stats(): Promise<{
     entries: number;
@@ -148,4 +158,5 @@ export interface NsContextService {
     daemon: DaemonHealthStatus;
   }>;
   daemonHealth(): Promise<DaemonHealthStatus>;
+  getSessionSummary?(sessionId: string): SessionContextSummary | undefined;
 }

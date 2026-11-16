@@ -13,8 +13,10 @@ import {
   validateKnowledgeWrite,
   type ContextMode,
   type ContextOffer,
+  type DaemonHealthStatus,
   type KnowledgeWriteRequest,
   type NsContextService,
+  type SessionContextSummary,
 } from '../core/index.js';
 
 export const name = 'ns-context';
@@ -26,6 +28,7 @@ export interface PluginConfig {
   inlineBytes: number;
   maxOffers: number;
   turn1TimeoutMs: number;
+  daemonTimeoutMs?: number;
 }
 
 export const Config: z<PluginConfig> = z.object({
@@ -34,6 +37,7 @@ export const Config: z<PluginConfig> = z.object({
   inlineBytes: z.number().default(1800),
   maxOffers: z.number().default(3),
   turn1TimeoutMs: z.number().default(50),
+  daemonTimeoutMs: z.number().default(2500),
 }) as unknown as z<PluginConfig>;
 
 declare module '@deepseek-ai/cordis' {
@@ -52,7 +56,9 @@ interface AgentSessionState {
   deferredWrites: KnowledgeWriteRequest[];
   lastTurnError: boolean;
   initialRetrieved: boolean;
-  eventSeq: number;
+  nextEventSeq: number;
+  lastAckedSeq: number;
+  retrievalEpoch: number;
   sseAbort?: AbortController;
   sseStarted: boolean;
   presentedAcked: Set<string>;
@@ -79,13 +85,31 @@ function extractLatestUserText(
     .trim();
 }
 
+function formatDaemonStatus(daemon: DaemonHealthStatus): string {
+  if (!daemon.configured) return 'daemon=unconfigured';
+  if (daemon.reachable) return `daemon=${daemon.strategy ?? 'ok'}`;
+  return `daemon=unavailable (${daemon.error ?? 'offline'})`;
+}
+
+function pruneAckedForOffers(st: AgentSessionState): void {
+  if (st.presentedAcked.size <= 128) return;
+  const activeIds = new Set(st.activeOffers.map((o) => o.id));
+  for (const key of st.presentedAcked) {
+    const colon = key.indexOf(':');
+    const entryId = colon >= 0 ? key.slice(colon + 1) : key;
+    if (!activeIds.has(entryId)) st.presentedAcked.delete(key);
+    if (st.presentedAcked.size <= 64) break;
+  }
+}
+
 export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void {
-  const config: PluginConfig = {
+  const config: Required<Omit<PluginConfig, 'daemonUrl'>> & { daemonUrl?: string } = {
     mode: rawConfig.mode ?? 'auto',
     daemonUrl: rawConfig.daemonUrl ?? process.env.FOREWISP_URL,
     inlineBytes: rawConfig.inlineBytes ?? 1800,
     maxOffers: rawConfig.maxOffers ?? 3,
     turn1TimeoutMs: rawConfig.turn1TimeoutMs ?? 50,
+    daemonTimeoutMs: rawConfig.daemonTimeoutMs ?? 2500,
   };
 
   let disposed = false;
@@ -109,6 +133,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   };
 
   const defaultBridge = getBridge(process.cwd());
+  const log = ctx.logger('ns-context');
 
   const states = new Map<string, AgentSessionState>();
   const stateFor = (agent: Agent): AgentSessionState => {
@@ -125,7 +150,9 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         deferredWrites: [],
         lastTurnError: false,
         initialRetrieved: false,
-        eventSeq: 0,
+        nextEventSeq: 1,
+        lastAckedSeq: 0,
+        retrievalEpoch: 0,
         sseStarted: false,
         presentedAcked: new Set(),
         lastTier: 'speed1_local',
@@ -137,20 +164,46 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     return st;
   };
 
-  ctx.provide('nsContext', Object.assign(defaultBridge, {
-    getSessionSummary: (sessionId: string) => {
-      const st = states.get(sessionId);
-      if (!st) return undefined;
+  const getSessionSummary = (sessionId: string): SessionContextSummary | undefined => {
+    const direct = states.get(sessionId);
+    if (direct) {
       return {
-        tier: st.lastTier,
-        strategy: st.lastStrategy,
-        daemonUnavailable: st.daemonUnavailable,
-        activeOffers: st.activeOffers.length,
-        totalOffersPresented: st.totalOffersPresented,
-        eventSeq: st.eventSeq,
+        tier: direct.lastTier,
+        strategy: direct.lastStrategy,
+        daemonUnavailable: direct.daemonUnavailable,
+        activeOffers: direct.activeOffers.length,
+        totalOffersPresented: direct.totalOffersPresented,
+        eventSeq: direct.lastAckedSeq,
       };
+    }
+    const stripped = sessionId.startsWith('ns-') ? sessionId.slice(3) : sessionId;
+    const byForewispId =
+      states.get(stripped) ?? Array.from(states.values()).find((item) => item.forewispSessionId === sessionId);
+    if (!byForewispId) return undefined;
+    return {
+      tier: byForewispId.lastTier,
+      strategy: byForewispId.lastStrategy,
+      daemonUnavailable: byForewispId.daemonUnavailable,
+      activeOffers: byForewispId.activeOffers.length,
+      totalOffersPresented: byForewispId.totalOffersPresented,
+      eventSeq: byForewispId.lastAckedSeq,
+    };
+  };
+
+  const providedService: NsContextService = {
+    get mode() {
+      return defaultBridge.mode;
     },
-  }));
+    retrieve: (query, conversationId, opts) => defaultBridge.retrieve(query, conversationId, opts),
+    expand: (id, opts) => defaultBridge.expand(id, opts),
+    upsert: (req) => defaultBridge.upsert(req),
+    feedback: (id, helpful, opts) => defaultBridge.feedback(id, helpful, opts),
+    markPresented: (conversationId, entryIds, opts) => defaultBridge.markPresented(conversationId, entryIds, opts),
+    stats: () => defaultBridge.stats(),
+    daemonHealth: () => defaultBridge.daemonHealth(),
+    getSessionSummary,
+  };
+  ctx.provide('nsContext', providedService);
 
   const agentRoot = (agent?: Agent): string => {
     const meta = (agent?.session as { meta?: { cwd?: string } } | undefined)?.meta;
@@ -193,33 +246,38 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     const daemon = bridge.getDaemonClient();
     if (!daemon || st.sseStarted || disposed) return;
     st.sseStarted = true;
-    st.sseAbort = new AbortController();
-    const signal = st.sseAbort.signal;
+    const controller = new AbortController();
+    st.sseAbort = controller;
+    const signal = controller.signal;
+    const streamEpoch = st.retrievalEpoch;
     void (async () => {
       try {
         for await (const ev of daemon.offersStream(st.forewispSessionId, signal)) {
           if (disposed || signal.aborted) break;
-          if (ev.sequence < st.eventSeq) continue;
+          if (ev.sequence < st.lastAckedSeq || st.retrievalEpoch > streamEpoch) continue;
           st.lastStrategy = ev.strategy;
           st.lastTier = ev.strategy === 'jev' ? 'forewisp_jev' : 'forewisp_lexical';
           st.daemonUnavailable = false;
           if (ev.entries.length > 0) {
-            const existing = new Set(st.activeOffers.map((o) => `${o.id}:${o.version}`));
-            const merged = [...st.activeOffers];
-            for (const entry of ev.entries) {
-              const key = `${entry.id}:${entry.version}`;
-              if (!existing.has(key)) {
-                existing.add(key);
-                merged.push(entry);
-              }
+            // Merge by unique entry id so newest SSE revisions replace stale ones cleanly.
+            const byId = new Map<string, ContextOffer>();
+            for (const entry of ev.entries) byId.set(entry.id, entry);
+            for (const old of st.activeOffers) {
+              if (!byId.has(old.id)) byId.set(old.id, old);
             }
-            st.activeOffers = merged.slice(0, config.maxOffers);
+            st.activeOffers = Array.from(byId.values()).slice(0, config.maxOffers);
+            pruneAckedForOffers(st);
           }
         }
-      } catch {
-        /* SSE closed or aborted cleanly */
+      } catch (err) {
+        if (!signal.aborted && !disposed) {
+          st.daemonUnavailable = true;
+          log.warn(`Forewisp offer stream error for ${st.forewispSessionId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
       } finally {
-        st.sseStarted = false;
+        if (!disposed && st.sseAbort === controller) {
+          st.sseStarted = false;
+        }
       }
     })();
   };
@@ -228,6 +286,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   ctx.on('agent/pre-step', async (payload, next) => {
     const st = stateFor(payload.agent);
     st.lastTurnError = false;
+    const myEpoch = (st.retrievalEpoch += 1);
     try {
       const bridge = getBridge(agentRoot(payload.agent));
       const userPrompt = extractLatestUserText(payload.messages);
@@ -235,26 +294,32 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
       const query = [userPrompt, coalesced].filter(Boolean).join(' ').trim();
 
       if (query && (!st.initialRetrieved || coalesced)) {
-        const defaultTimeout = bridge.getDaemonClient() ? 2500 : 150;
-        const timeoutMs = st.initialRetrieved ? config.turn1TimeoutMs : Math.max(config.turn1TimeoutMs, defaultTimeout);
+        const hasDaemon = Boolean(bridge.getDaemonClient());
+        const timeoutMs = hasDaemon ? config.daemonTimeoutMs : config.turn1TimeoutMs;
         const res = await bridge.retrieve(query, st.conversationId, { timeoutMs });
-        st.initialRetrieved = true;
-        st.activeOffers = res.offers;
-        st.lastTier = res.tier;
-        st.lastStrategy = res.strategy;
-        st.daemonUnavailable = Boolean(res.daemonUnavailable);
+        if (st.retrievalEpoch === myEpoch) {
+          st.initialRetrieved = true;
+          st.activeOffers = res.offers;
+          st.lastTier = res.tier;
+          st.lastStrategy = res.strategy;
+          st.daemonUnavailable = Boolean(res.daemonUnavailable);
+          pruneAckedForOffers(st);
+        }
 
         const daemon = bridge.getDaemonClient();
-        if (daemon && config.mode !== 'local' && !res.daemonUnavailable) {
-          const seq = (st.eventSeq += 1);
+        if (daemon && config.mode !== 'local' && !res.daemonUnavailable && !disposed) {
+          const seq = st.nextEventSeq;
+          st.nextEventSeq += 1;
           void daemon
             .observeEvent(st.forewispSessionId, seq, query, {
               kinds: ['memory', 'skill', 'plugin'],
-              timeoutMs: 2500,
+              timeoutMs: config.daemonTimeoutMs,
             })
             .then((ack) => {
-              if (ack.accepted && !st.sseStarted && !disposed) {
-                startOfferStream(st, bridge);
+              if (disposed) return;
+              if (ack.accepted) {
+                st.lastAckedSeq = Math.max(st.lastAckedSeq, ack.sequence);
+                if (!st.sseStarted) startOfferStream(st, bridge);
               }
             })
             .catch(() => {
@@ -276,7 +341,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (rawSessionId !== undefined) {
       const st = states.get(String(rawSessionId));
       if (st && st.renderedMeta.length > 0) {
-        const snapshot = st.renderedMeta.splice(0, st.renderedMeta.length);
+        const snapshot = [...st.renderedMeta];
         try {
           const bridge = getBridge(agentRoot(st.agent));
           const withOffer = snapshot.find((s) => s.offerId);
@@ -285,6 +350,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             snapshot.map((s) => s.key),
             withOffer ? { offerId: withOffer.offerId } : undefined,
           );
+          st.renderedMeta = [];
           st.totalOffersPresented += snapshot.length;
           const daemon = bridge.getDaemonClient();
           if (daemon) {
@@ -298,8 +364,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               });
             }
           }
-        } catch {
-          /* non-fatal telemetry receipt */
+        } catch (err) {
+          log.warn(`markPresented failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }
@@ -327,8 +393,6 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (toolName.startsWith('forewisp_')) return;
     st.coalescer.recordToolEvent(toolName, ev.data?.args, Boolean(ev.data?.isError), String(ev.data?.summary ?? ''));
   });
-
-  const log = ctx.logger('ns-context');
 
   ctx.on('agent/error', ({ agent }) => {
     const st = states.get(String(agent.session.id));
@@ -403,6 +467,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         const res = await bridge.retrieve(args.query, exec.agent ? String(exec.agent.session.id) : 'manual');
         return {
           tier: res.tier,
+          strategy: res.strategy,
+          daemonUnavailable: res.daemonUnavailable,
           latencyMs: res.latencyMs,
           offers: res.offers.map((o) => ({
             id: o.id,
@@ -513,11 +579,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
           const q = rawInput.trim();
           if (!q || q === 'stats') {
             const st = await bridge.stats();
-            const daemonTxt = st.daemon.configured
-              ? st.daemon.reachable
-                ? `daemon=${st.daemon.strategy ?? 'ok'}`
-                : `daemon=unavailable (${st.daemon.error ?? 'offline'})`
-              : 'daemon=unconfigured';
+            const daemonTxt = formatDaemonStatus(st.daemon);
             return {
               kind: 'success',
               text: `Forewisp (${bridge.mode}, ${daemonTxt}): ${st.active} active / ${st.entries} total (${st.drifted} drifted, ${st.presentedCount} delivered).`,

@@ -27,6 +27,7 @@ export declare class ForewispBridge implements NsContextService {
     markPresented(conversationId: string, entryIds: readonly string[], opts?: {
         offerId?: string;
     }): void;
+    private pageUtf8;
     expand(id: string, opts?: {
         allowStale?: boolean;
         offset?: number;
@@ -35,6 +36,7 @@ export declare class ForewispBridge implements NsContextService {
         found: boolean;
         stale: boolean;
         driftedFiles: string[];
+        daemonUnavailable?: boolean;
         content?: string;
         totalBytes?: number;
         version?: number;
@@ -50,6 +52,7 @@ export declare class ForewispBridge implements NsContextService {
         helpful: number;
         harmful: number;
         daemonRecorded?: boolean;
+        localFound?: boolean;
     }>;
     stats(): Promise<{
         entries: number;

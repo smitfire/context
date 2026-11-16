@@ -25,11 +25,13 @@ function mapKindToForewisp(kind) {
     return 'memory';
 }
 function mapScopeToForewisp(scope) {
-    if (scope === 'agent' || scope === 'user')
+    if (scope === undefined || scope === 'agent' || scope === 'user' || scope === 'repository')
         return 'private';
+    if (scope === 'organization')
+        return 'organization';
     if (scope === 'public')
         return 'community';
-    return 'organization';
+    throw new Error(`Unsupported context scope for Forewisp daemon: ${String(scope)}`);
 }
 function parseOfferEntry(raw, offerId, sessionId) {
     if (!isObject(raw))
@@ -225,9 +227,14 @@ export class ForewispDaemonClient {
         };
     }
     async feedback(sessionId, offerId, entryId, verdict, timeoutMs = 2000) {
-        const numOffer = Number(offerId);
-        if (!Number.isSafeInteger(numOffer) || numOffer < 1)
-            return false;
+        const rawOffer = String(offerId).trim();
+        if (!/^\d+$/.test(rawOffer)) {
+            throw new Error(`Invalid non-numeric Forewisp offer_id: ${rawOffer}`);
+        }
+        const numOffer = Number(rawOffer);
+        if (!Number.isSafeInteger(numOffer) || numOffer < 1) {
+            throw new Error(`Out-of-range Forewisp offer_id: ${rawOffer}`);
+        }
         const resp = await this.fetcher(this.url('/v1/feedback'), {
             method: 'POST',
             redirect: 'error',
@@ -289,16 +296,24 @@ export class ForewispDaemonClient {
                         .filter((l) => l.startsWith('data:'))
                         .map((l) => l.slice(5).trimStart())
                         .join('\n');
-                    const raw = JSON.parse(dataStr);
-                    const offerId = String(raw.id ?? id);
+                    let raw;
+                    try {
+                        raw = JSON.parse(dataStr);
+                    }
+                    catch {
+                        continue;
+                    }
+                    const offerIdStr = raw.id !== undefined ? String(raw.id) : id;
+                    if (!/^\d+$/.test(offerIdStr))
+                        continue;
                     const sid = typeof raw.session_id === 'string' ? raw.session_id : sessionId;
                     const rawEntries = Array.isArray(raw.entries) ? raw.entries : [];
                     const entries = rawEntries
-                        .map((e) => parseOfferEntry(e, offerId, sid))
+                        .map((e) => parseOfferEntry(e, offerIdStr, sid))
                         .filter((e) => e !== null);
                     yield {
                         cursor: id,
-                        offerId,
+                        offerId: offerIdStr,
                         sessionId: sid,
                         sequence: typeof raw.sequence === 'number' ? raw.sequence : 1,
                         strategy: typeof raw.strategy === 'string' ? raw.strategy : 'lexical',
