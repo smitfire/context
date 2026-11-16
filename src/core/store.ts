@@ -287,10 +287,18 @@ export class ForewispBridge implements NsContextService {
         : queryTokens.filter((t) => entryTokens.has(t)).length / queryTokens.length;
       if (overlap === 0 && Number(row.fts_score ?? 0) <= 0) continue;
 
+      // Bound cold-start Turn-1 hashing to 64 distinct files; rows are pre-ordered by fts_score DESC.
       const driftedFiles =
-        Object.keys(entry.sourceHashes).length === 0 || fileHashCache.size >= 64
+        Object.keys(entry.sourceHashes).length === 0
           ? []
-          : detectDriftedFiles(this.workspaceRoot, entry.sourceHashes, fileHashCache);
+          : fileHashCache.size >= 64
+            ? Object.entries(entry.sourceHashes)
+                .filter(([rel]) => {
+                  const cached = fileHashCache.get(rel);
+                  return cached !== undefined && cached !== entry.sourceHashes[rel];
+                })
+                .map(([rel]) => rel)
+            : detectDriftedFiles(this.workspaceRoot, entry.sourceHashes, fileHashCache);
       // 90-day half-life Beta(1,1) posterior weighting.
       const ageDays = Math.max(0, (nowSec - entry.updatedAt) / 86400);
       const decay = Math.pow(0.5, ageDays / 90);
@@ -444,6 +452,7 @@ export class ForewispBridge implements NsContextService {
     const nowSec = Math.floor(Date.now() / 1000);
 
     this.db.exec('BEGIN IMMEDIATE');
+    let inTx = true;
     try {
       const existingRow = this.db
         .prepare('SELECT * FROM entries WHERE id = ?')
@@ -456,6 +465,7 @@ export class ForewispBridge implements NsContextService {
           (req.baseRecordSha256 !== undefined && req.baseRecordSha256 !== current.recordSha256)
         ) {
           this.db.exec('ROLLBACK');
+          inTx = false;
           return {
             ok: false,
             status: 'conflict',
@@ -492,6 +502,7 @@ export class ForewispBridge implements NsContextService {
           .prepare('INSERT INTO entries_fts (id, title, summary, body, keywords) VALUES (?, ?, ?, ?, ?)')
           .run(deterministicId, req.title.trim(), req.summary.trim(), req.body.trim(), keywords);
         this.db.exec('COMMIT');
+        inTx = false;
         return { ok: true, status: 'updated', id: deterministicId, version: nextVer, recordSha256 };
       }
 
@@ -517,9 +528,12 @@ export class ForewispBridge implements NsContextService {
         .prepare('INSERT INTO entries_fts (id, title, summary, body, keywords) VALUES (?, ?, ?, ?, ?)')
         .run(deterministicId, req.title.trim(), req.summary.trim(), req.body.trim(), keywords);
       this.db.exec('COMMIT');
+      inTx = false;
       return { ok: true, status: 'inserted', id: deterministicId, version: 1, recordSha256 };
     } catch (err) {
-      this.db.exec('ROLLBACK');
+      if (inTx) {
+        try { this.db.exec('ROLLBACK'); } catch { /* preserve original error if already rolled back */ }
+      }
       throw err;
     }
   }
