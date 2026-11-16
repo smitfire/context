@@ -1,0 +1,1 @@
+{"version":3,"file":"coalescer.d.ts","sourceRoot":"","sources":["../../src/core/coalescer.ts"],"names":[],"mappings":"AAAA,yFAAyF;AACzF,qBAAa,oBAAoB;IAC/B,OAAO,CAAC,QAAQ,CAAC,aAAa,CAAqB;IACnD,OAAO,CAAC,cAAc,CAAgB;IAEtC,eAAe,CAAC,IAAI,EAAE,MAAM,EAAE,IAAI,EAAE,OAAO,EAAE,OAAO,EAAE,OAAO,EAAE,aAAa,CAAC,EAAE,MAAM,GAAG,OAAO;IAoB/F,UAAU,IAAI,MAAM,GAAG,IAAI;CAM5B"}

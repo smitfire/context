@@ -98,16 +98,33 @@ test('CAS revision check, SHA-256 live file-drift guard, and zero-import distrac
     assert.equal(hit.offers[0].id, ins.id);
     assert.equal(hit.offers[0].driftedFiles.length, 0);
 
-    // 3. Stale CAS revision update fails with conflict
-    const staleCas = await bridge.upsert({
-      id: ins.id,
-      kind: 'memory',
-      title: 'Express router port invariant',
-      summary: 'Updated summary',
-      body: 'Updated body',
-      baseRevision: 99,
-    });
-    assert.equal(staleCas.status, 'conflict');
+    // 3. Atomic CAS update succeeds for matching v1 and rejects stale concurrent writer
+    const [u1, u2] = await Promise.all([
+      bridge.upsert({
+        id: ins.id,
+        kind: 'memory',
+        title: 'Express router port invariant',
+        summary: 'Router listens on port 3000 in src/router.ts',
+        body: 'src/router.ts exports port 3000 for Express router startup.',
+        keywords: 'express router port',
+        sourcePaths: ['src/router.ts'],
+        wikitrace: { ecosystem: 'node', packages: { express: '^4.0.0' } },
+        baseRevision: 1,
+        baseRecordSha256: ins.recordSha256,
+      }),
+      bridge.upsert({
+        id: ins.id,
+        kind: 'memory',
+        title: 'Express router port invariant',
+        summary: 'Competing update at v1',
+        body: 'Competing update at v1',
+        baseRevision: 1,
+        baseRecordSha256: ins.recordSha256,
+      }),
+    ]);
+    assert.equal(u1.ok, true);
+    assert.equal(u1.version, 2);
+    assert.equal(u2.status, 'conflict');
 
     // 4. Modify src/router.ts -> drift warning suppresses inline body & blocks unforced expand
     writeFileSync(join(dir, 'src/router.ts'), 'export const port = 8080;\n');
