@@ -180,7 +180,7 @@ test('DSH 0.2.2-rc.3 Cordis plugin mounts tools, pre-step context, and llm/strea
       turn: 1,
       step: 1,
       signal: AbortSignal.timeout(5000),
-      modelSelection: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' } as never,
+      modelSelection: { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' } as never,
     },
     async () => ({ kind: 'enter', messages: [] }),
   );
