@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
-import { ForewispBridge } from '../dist/core/index.js';
+import { ForewispBridge, resolveContextLocalDbPath } from '../dist/core/index.js';
 import * as contextPlugin from '../dist/dsh/index.js';
 import { runPreInvocationHook } from '../dist/mcp/server.js';
 
@@ -406,5 +406,57 @@ test('ForewispBridge integrates live v1/recall, JEV strategy, SSE offers, presen
   } finally {
     bridge.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ns-context defaults local SQLite into NS_DSH_STATE_DIR in clean repos while honoring legacy .forewisp/local.db', async () => {
+  const cleanRepo = makeTempRepo();
+  const legacyRepo = makeTempRepo();
+  const stateDir = makeTempRepo();
+  const prevState = process.env.NS_DSH_STATE_DIR;
+  const prevDb = process.env.NS_CONTEXT_DB_PATH;
+  delete process.env.NS_CONTEXT_DB_PATH;
+  process.env.NS_DSH_STATE_DIR = stateDir;
+
+  let cleanBridge: ForewispBridge | undefined;
+  let legacyBridge: ForewispBridge | undefined;
+  try {
+    cleanBridge = new ForewispBridge({ workspaceRoot: cleanRepo, mode: 'local' });
+    await cleanBridge.upsert({
+      kind: 'memory',
+      title: 'Clean state test',
+      summary: 'Stored outside clean repo',
+      body: 'Verifies clean git repos stay free of untracked .forewisp dirs.',
+    });
+    const resolvedCleanDb = resolveContextLocalDbPath(cleanRepo);
+    assert.equal(resolvedCleanDb.startsWith(resolve(stateDir)), true);
+    assert.equal(existsSync(resolvedCleanDb), true);
+    assert.equal(existsSync(join(cleanRepo, '.forewisp')), false);
+
+    // Create valid pre-existing local.db first so legacy lookup sees it
+    delete process.env.NS_DSH_STATE_DIR;
+    const seedBridge = new ForewispBridge({ workspaceRoot: legacyRepo, mode: 'local' });
+    seedBridge.close();
+    assert.equal(existsSync(join(legacyRepo, '.forewisp', 'local.db')), true);
+
+    process.env.NS_DSH_STATE_DIR = stateDir;
+    legacyBridge = new ForewispBridge({ workspaceRoot: legacyRepo, mode: 'local' });
+    await legacyBridge.upsert({
+      kind: 'memory',
+      title: 'Legacy local test',
+      summary: 'Reuses existing .forewisp/local.db',
+      body: 'Existing .forewisp/local.db stays authoritative.',
+    });
+    assert.equal(existsSync(join(legacyRepo, '.forewisp', 'local.db')), true);
+  } finally {
+    cleanBridge?.close();
+    legacyBridge?.close();
+    if (prevState === undefined) delete process.env.NS_DSH_STATE_DIR;
+    else process.env.NS_DSH_STATE_DIR = prevState;
+    if (prevDb === undefined) delete process.env.NS_CONTEXT_DB_PATH;
+    else process.env.NS_CONTEXT_DB_PATH = prevDb;
+    rmSync(cleanRepo, { recursive: true, force: true });
+    rmSync(legacyRepo, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });

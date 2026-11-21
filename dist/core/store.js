@@ -23,6 +23,26 @@ function jaccardOverlap(a, b) {
             shared += 1;
     return shared / Math.max(a.size, b.size);
 }
+export function resolveContextLocalDbPath(workspaceRoot, explicitDbPath) {
+    const envDb = process.env.NS_CONTEXT_DB_PATH?.trim();
+    if (envDb)
+        return resolve(envDb);
+    if (explicitDbPath?.trim())
+        return resolve(workspaceRoot, explicitDbPath.trim());
+    const legacyLocal = resolve(workspaceRoot, '.forewisp', 'local.db');
+    if (existsSync(legacyLocal))
+        return legacyLocal;
+    const stateDir = process.env.NS_DSH_STATE_DIR?.trim();
+    if (stateDir) {
+        const rootResolved = resolve(workspaceRoot);
+        if (rootResolved === resolve(process.cwd())) {
+            return join(resolve(stateDir), 'forewisp-local.db');
+        }
+        const wsHash = createHash('sha256').update(rootResolved).digest('hex').slice(0, 10);
+        return join(resolve(stateDir), `forewisp-local-${wsHash}.db`);
+    }
+    return legacyLocal;
+}
 export class ForewispBridge {
     mode;
     workspaceRoot;
@@ -39,7 +59,7 @@ export class ForewispBridge {
     cachedDeps;
     constructor(options) {
         this.workspaceRoot = resolve(options.workspaceRoot);
-        this.dbPath = resolve(options.dbPath ?? join(this.workspaceRoot, '.forewisp', 'local.db'));
+        this.dbPath = resolveContextLocalDbPath(this.workspaceRoot, options.dbPath);
         this.mode = options.mode ?? 'auto';
         this.daemonUrl = options.daemonUrl ?? process.env.FOREWISP_URL;
         this.daemonToken = options.daemonToken ?? process.env.FOREWISP_API_TOKEN;

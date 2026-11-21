@@ -7,6 +7,7 @@ export const inject = ['tools', 'agents', 'systemPrompt'];
 export const Config = z.object({
     mode: z.union([z.const('auto'), z.const('local'), z.const('daemon')]).default('auto'),
     daemonUrl: z.string(),
+    dbPath: z.string(),
     inlineBytes: z.number().default(1800),
     maxOffers: z.number().default(3),
     turn1TimeoutMs: z.number().default(50),
@@ -68,6 +69,7 @@ export function apply(ctx, rawConfig = {}) {
     const config = {
         mode: rawConfig.mode ?? 'auto',
         daemonUrl: rawConfig.daemonUrl ?? process.env.FOREWISP_URL,
+        dbPath: rawConfig.dbPath,
         inlineBytes: rawConfig.inlineBytes ?? 1800,
         maxOffers: rawConfig.maxOffers ?? 3,
         turn1TimeoutMs: rawConfig.turn1TimeoutMs ?? 50,
@@ -83,6 +85,7 @@ export function apply(ctx, rawConfig = {}) {
         if (!bridge) {
             bridge = new ForewispBridge({
                 workspaceRoot: key,
+                dbPath: config.dbPath,
                 mode: config.mode,
                 daemonUrl: config.daemonUrl,
                 inlineBytes: config.inlineBytes,
