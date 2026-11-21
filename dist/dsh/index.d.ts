@@ -6,6 +6,7 @@ export declare const inject: readonly ["tools", "agents", "systemPrompt"];
 export interface PluginConfig {
     mode: ContextMode;
     daemonUrl?: string;
+    dbPath?: string;
     inlineBytes: number;
     maxOffers: number;
     turn1TimeoutMs: number;

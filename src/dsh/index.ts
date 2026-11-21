@@ -26,6 +26,7 @@ export const inject = ['tools', 'agents', 'systemPrompt'] as const;
 export interface PluginConfig {
   mode: ContextMode;
   daemonUrl?: string;
+  dbPath?: string;
   inlineBytes: number;
   maxOffers: number;
   turn1TimeoutMs: number;
@@ -35,6 +36,7 @@ export interface PluginConfig {
 export const Config: z<PluginConfig> = z.object({
   mode: z.union([z.const('auto'), z.const('local'), z.const('daemon')]).default('auto'),
   daemonUrl: z.string(),
+  dbPath: z.string(),
   inlineBytes: z.number().default(1800),
   maxOffers: z.number().default(3),
   turn1TimeoutMs: z.number().default(50),
@@ -128,9 +130,10 @@ function pruneAckedForOffers(st: AgentSessionState): void {
 }
 
 export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void {
-  const config: Required<Omit<PluginConfig, 'daemonUrl'>> & { daemonUrl?: string } = {
+  const config: Required<Omit<PluginConfig, 'daemonUrl' | 'dbPath'>> & { daemonUrl?: string; dbPath?: string } = {
     mode: rawConfig.mode ?? 'auto',
     daemonUrl: rawConfig.daemonUrl ?? process.env.FOREWISP_URL,
+    dbPath: rawConfig.dbPath,
     inlineBytes: rawConfig.inlineBytes ?? 1800,
     maxOffers: rawConfig.maxOffers ?? 3,
     turn1TimeoutMs: rawConfig.turn1TimeoutMs ?? 50,
@@ -146,6 +149,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (!bridge) {
       bridge = new ForewispBridge({
         workspaceRoot: key,
+        dbPath: config.dbPath,
         mode: config.mode,
         daemonUrl: config.daemonUrl,
         inlineBytes: config.inlineBytes,

@@ -1,5 +1,6 @@
 import type { ContextBridgeOptions, ContextMode, DaemonHealthStatus, KnowledgeWriteRequest, NsContextService, RetrievalResult, UpsertOutcome } from './types.js';
 import { ForewispDaemonClient } from './daemon-client.js';
+export declare function resolveContextLocalDbPath(workspaceRoot: string, explicitDbPath?: string): string;
 export declare class ForewispBridge implements NsContextService {
     readonly mode: ContextMode;
     private readonly workspaceRoot;
